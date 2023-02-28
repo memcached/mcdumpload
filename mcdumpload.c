@@ -130,6 +130,7 @@ struct mcdump_buf {
 #define KEYSBUF_SIZE 65536
 #define DATA_WRITEBUF_SIZE KEYSBUF_SIZE * 2
 #define DATA_READBUF_SIZE (1024 * 1024 * 16)
+#define MIN_KEYOUT_SPACE 1024
 
 // apply rate limiter here?
 // would allow avoiding memove of data_cmds buf since we just wait for it to
@@ -155,8 +156,7 @@ static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *d
 
         size_t len = end - start;
         // ensure space in data_cmds.
-        if (data_cmds->size - data_cmds->filled <
-                len + sizeof(MGDUMP_FLAGS) + 2) {
+        if (data_cmds->size - data_cmds->filled < MIN_KEYOUT_SPACE) {
             break;
         }
 
@@ -526,7 +526,8 @@ static int run_dump(struct mcdump_conf *conf) {
 
         // Set polling for next round.
         // If there's no space in the keys buffer, don't keep checking read.
-        if (keys_buf.filled < keys_buf.size) {
+        if (keys_buf.filled < keys_buf.size
+                && keys_out_buf.size - keys_out_buf.filled > MIN_KEYOUT_SPACE) {
             to_poll[POLL_KEYS].events = POLLIN;
         } else {
             to_poll[POLL_KEYS].events = 0;
@@ -535,7 +536,10 @@ static int run_dump(struct mcdump_conf *conf) {
         // If we have no keys to move to the key out buffer, and no data
         // currently being flushed to the data in fd, don't poll.
         if (keys_buf.filled <= keys_buf.consumed
-                && keys_out_buf.filled <= keys_out_buf.consumed) {
+                && keys_out_buf.size - keys_out_buf.filled < MIN_KEYOUT_SPACE) {
+            to_poll[POLL_KEYOUT].events = 0;
+        } else if (data_read_buf.size == data_read_buf.filled) {
+            // destination buffer is full, wait before fetching more keys.
             to_poll[POLL_KEYOUT].events = 0;
         } else {
             to_poll[POLL_KEYOUT].events = POLLIN|POLLOUT;
