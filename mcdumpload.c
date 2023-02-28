@@ -157,7 +157,6 @@ static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *d
         // ensure space in data_cmds.
         if (data_cmds->size - data_cmds->filled <
                 len + sizeof(MGDUMP_FLAGS) + 2) {
-            fprintf(stderr, "dump buffer full\n");
             break;
         }
 
