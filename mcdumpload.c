@@ -524,6 +524,30 @@ static int run_dump(struct mcdump_conf *conf) {
             fprintf(stderr, "Dumpload complete\n");
             break;
         }
+
+        // Set polling for next round.
+        // If there's no space in the keys buffer, don't keep checking read.
+        if (keys_buf.filled < keys_buf.size) {
+            to_poll[POLL_KEYS].events = POLLIN;
+        } else {
+            to_poll[POLL_KEYS].events = 0;
+        }
+
+        // If we have no keys to move to the key out buffer, and no data
+        // currently being flushed to the data in fd, don't poll.
+        if (keys_buf.filled <= keys_buf.consumed
+                && keys_out_buf.filled <= keys_out_buf.consumed) {
+            to_poll[POLL_KEYOUT].events = 0;
+        } else {
+            to_poll[POLL_KEYOUT].events = POLLIN|POLLOUT;
+        }
+
+        // If there's no converted data to for the destination, don't poll.
+        if (data_read_buf.parsed <= data_read_buf.consumed) {
+            to_poll[POLL_DEST].events = 0;
+        } else {
+            to_poll[POLL_DEST].events = POLLIN|POLLOUT;
+        }
     }
 
     while (1) {
