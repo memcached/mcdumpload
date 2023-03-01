@@ -158,7 +158,6 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
                 timersub(&l->window_end, &now, &tosleep);
                 // should never be higher than a second...
                 usleep(tosleep.tv_usec);
-                fprintf(stderr, "USLEEP: %ld\n", tosleep.tv_usec);
                 // reset window to future
                 gettimeofday(&now, NULL);
                 timeradd(&now, &toadd, &l->window_end);
@@ -544,10 +543,28 @@ static int run_dump(struct mcdump_conf *conf) {
     data_read_buf.buf = malloc(DATA_READBUF_SIZE);
     data_read_buf.size = DATA_READBUF_SIZE;
 
-    // TODO: loop-read here until the command returns non-busy
-    int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
-    if (sent < sizeof(MGDUMP_START)-1) {
-        abort();
+    while (1) {
+        int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
+        if (sent < sizeof(MGDUMP_START)-1) {
+            fprintf(stderr, "ERROR: Failed write for fetching key list\n");
+            exit(EXIT_FAILURE);
+        }
+        poll_for(to_poll, POLL_KEYS, POLLIN);
+        // Do a trial read.
+        run_keys(keys_fd, &keys_buf);
+        if (keys_buf.filled >= 4) {
+            if (strncmp(keys_buf.buf, "BUSY", 4) == 0) {
+                // reset the keys buffer and loop again.
+                keys_buf.filled = 0;
+                sleep(1);
+                continue;
+            } else if (strncmp(keys_buf.buf, "mg", 2) != 0) {
+                fprintf(stderr, "ERROR: Unexpected response from key dump: %.*s\n",
+                        keys_buf.filled, keys_buf.buf);
+                exit(EXIT_FAILURE);
+            }
+            break;
+        }
     }
 
     // core loop
