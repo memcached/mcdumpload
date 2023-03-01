@@ -111,6 +111,7 @@ struct mcdump_conf {
     char dest_host[NI_MAXHOST];
     char dest_port[NI_MAXSERV];
     uint32_t dest_bwlimit; // kilobytes per timeslice
+    uint32_t read_bufsize; // megabytes
 };
 
 struct mcdump_bwlim {
@@ -175,7 +176,7 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
 #define MGDUMP_FLAGS " k f t v q u Oo\r\n"
 #define KEYSBUF_SIZE 65536
 #define DATA_WRITEBUF_SIZE KEYSBUF_SIZE * 2
-#define DATA_READBUF_SIZE (1024 * 1024 * 16)
+#define DATA_READBUF_DEFAULT (1024 * 2)
 #define MIN_KEYOUT_SPACE 1024
 
 // apply rate limiter here?
@@ -425,8 +426,6 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
     keys->filled += read;
 }
 
-// TODO: check fetch rate limiter and wait?
-// or is that simply a sleep elsewhere?
 // TODO: max pipelines per fetch?
 static void run_data_out(int data_fd, struct mcdump_buf *keys, struct mcdump_buf *data) {
     // Do we have anything to write?
@@ -524,7 +523,6 @@ static int run_dump(struct mcdump_conf *conf) {
     bwlimit.limit = conf->dest_bwlimit;
     bwlimit.remain = bwlimit.limit; // seed the limiter.
 
-    // TODO: commandline arguments
     int keys_fd = dump_connect(conf->source_host, conf->source_port);
     int kout_fd = dump_connect(conf->source_host, conf->source_port);
     int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
@@ -540,8 +538,8 @@ static int run_dump(struct mcdump_conf *conf) {
     keys_buf.size = KEYSBUF_SIZE;
     keys_out_buf.buf = malloc(DATA_WRITEBUF_SIZE);
     keys_out_buf.size = DATA_WRITEBUF_SIZE;
-    data_read_buf.buf = malloc(DATA_READBUF_SIZE);
-    data_read_buf.size = DATA_READBUF_SIZE;
+    data_read_buf.buf = malloc(conf->read_bufsize);
+    data_read_buf.size = conf->read_bufsize;
 
     while (1) {
         int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
@@ -650,11 +648,12 @@ static int run_dump(struct mcdump_conf *conf) {
 
 static void usage(void) {
     printf("usage:\n"
-           "--srcip=<addr>\n"
-           "--srcport=<port>\n"
-           "--dstip=<addr>\n"
-           "--dstport=<port>\n"
-           "--dstbwlimit=<kilobits/sec>\n"
+           "--srcip=<addr> (127.0.0.1)\n"
+           "--srcport=<port> (11211)\n"
+           "--dstip=<addr> (no default)\n"
+           "--dstport=<port> (no default)\n"
+           "--dstbwlimit=<kilobits/sec> (0)\n"
+           "--readbufsize=<megabytes> (2)\n"
           );
 }
 
@@ -662,7 +661,7 @@ static void usage(void) {
 // - add a "stdout" mode
 int main(int argc, char **argv) {
     struct mcdump_conf conf = {.source_host = "127.0.0.1", .source_port = "11211",
-                               .dest_bwlimit = 0};
+                               .dest_bwlimit = 0, .read_bufsize = DATA_READBUF_DEFAULT};
     int dest_host = 0;
     int dest_port = 0;
     const struct option longopts[] = {
@@ -670,7 +669,8 @@ int main(int argc, char **argv) {
         {"srcport", required_argument, 0, 'p'},
         {"dstip", required_argument, 0, 'd'},
         {"dstport", required_argument, 0, 's'},
-        {"dstbwlimit", required_argument, 0, 'b'},
+        {"dstbwlimit", required_argument, 0, 'l'},
+        {"readbufsize", required_argument, 0, 'b'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -693,8 +693,11 @@ int main(int argc, char **argv) {
             strncpy(conf.dest_port, optarg, NI_MAXSERV-1);
             dest_port = 1;
             break;
-        case 'b':
+        case 'l':
             conf.dest_bwlimit = atoi(optarg);
+            break;
+        case 'b':
+            conf.read_bufsize = atoi(optarg) * (1024 * 1024);
             break;
         case 'h':
             usage();
