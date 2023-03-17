@@ -127,6 +127,7 @@ struct mcdump_buf {
     int filled;
     int consumed;
     int parsed; // used just for the data transformer
+    int pending; // for pipeline rate limiting of requests out/in
     int complete; // 0 or 1 to indicate if this stream has completed.
     int want_readpoll;
     int want_writepoll;
@@ -181,6 +182,7 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
 #define DATA_WRITEBUF_SIZE KEYSBUF_SIZE * 2
 #define DATA_READBUF_DEFAULT (1024 * 1024 * 2)
 #define MIN_KEYOUT_SPACE 1024
+#define PIPELINES_DEFAULT 32
 
 // apply rate limiter here?
 // would allow avoiding memove of data_cmds buf since we just wait for it to
@@ -190,7 +192,7 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
     // memchr to find \n in keys.buf + consumed
     // if found, and enough space in data_cmds.buf + filled, copy + add flags
     // if not found or space full, advance dump consumed
-    while (1) {
+    for (int x = 0; x < PIPELINES_DEFAULT; x++) {
         char *start = keys->buf + keys->consumed;
         char *end = memchr(keys->buf + keys->consumed, '\n',
                         keys->filled - keys->consumed);
@@ -235,6 +237,7 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
         data += sizeof(MGDUMP_FLAGS)-1;
 
         requests->filled += data - sdata;
+        requests->pending++;
         //fprintf(stderr, "Copied command: %.*s\n", (int)(data - sdata)-1, sdata);
 
         // ran out of keys to copy.
@@ -248,12 +251,13 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
 
 #define TEMP_SIZE 512
 
-static void convert_data_in(struct mcdump_buf *data_in) {
+static int convert_data_in(struct mcdump_buf *data_in) {
     char temp[TEMP_SIZE];
     int temp_len = 0;
     int parsed = data_in->parsed;
+    int converted = 0;
     if (data_in->complete) {
-        return;
+        return 0;
     }
     if (data_in->filled < data_in->parsed) {
         abort();
@@ -398,6 +402,7 @@ static void convert_data_in(struct mcdump_buf *data_in) {
         // done...
         parsed += end - start + 1; // include the \n
         parsed += vsize;
+        converted++;
 
         if (parsed >= data_in->filled)
             break;
@@ -407,22 +412,23 @@ static void convert_data_in(struct mcdump_buf *data_in) {
     if (data_in->filled < data_in->parsed) {
         abort();
     }
+    return converted;
 }
 
 static void run_keys(int keys_fd, struct mcdump_buf *keys) {
     // No space to continue reading.
+    keys->want_readpoll = 0;
     if (keys->filled == keys->size) {
         return;
     }
 
     // Stream completed? Though we shouldn't be continuing to get read events
     if (keys->filled > 3) {
-        if (strncmp(keys->buf, "EN\r\n", 4) == 0) {
+        if (strncmp(keys->buf + keys->filled - 4, "EN\r\n", 4) == 0) {
             return;
         }
     }
 
-    keys->want_readpoll = 0;
     int read = recv(keys_fd, keys->buf + keys->filled, keys->size - keys->filled, 0);
     if (read == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -436,9 +442,11 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
     }
 }
 
-// TODO: max pipelines per fetch?
 static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump_buf *requests) {
-    // Do we have anything to write?
+    // Flush previous buffer and read responses before requesting more
+    // TODO: when enforced, waits for all responses before sending more
+    // requests, but seems to 8x the CPU usage of the dumploader.
+    //if (requests->filled <= requests->consumed && requests->pending == 0) {
     if (requests->filled <= requests->consumed) {
         // No key data to work with right now.
         if (keys->filled <= keys->consumed) {
@@ -470,7 +478,7 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
     }
 }
 
-static void run_data_in(int data_fd, struct mcdump_buf *data) {
+static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf *requests) {
     // if space, read as much as we can
     if (data->filled < data->size) {
         data->want_readpoll = 0;
@@ -484,7 +492,8 @@ static void run_data_in(int data_fd, struct mcdump_buf *data) {
             }
         } else {
             data->filled += read;
-            convert_data_in(data);
+            int converted = convert_data_in(data);
+            requests->pending -= converted;
         }
     }
 }
@@ -605,7 +614,7 @@ static int run_dump(struct mcdump_conf *conf) {
         }
 
         run_requests_out(reqs_fd, &keys_buf, &requests_buf);
-        run_data_in(reqs_fd, &data_read_buf);
+        run_data_in(reqs_fd, &data_read_buf, &requests_buf);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
 
         // Set polling for next round.
