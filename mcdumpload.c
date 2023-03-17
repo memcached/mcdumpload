@@ -185,7 +185,7 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
 // apply rate limiter here?
 // would allow avoiding memove of data_cmds buf since we just wait for it to
 // drain
-static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *data_cmds) {
+static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requests) {
     // loop:
     // memchr to find \n in keys.buf + consumed
     // if found, and enough space in data_cmds.buf + filled, copy + add flags
@@ -206,7 +206,7 @@ static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *d
 
         size_t len = end - start;
         // ensure space in data_cmds.
-        if (data_cmds->size - data_cmds->filled < MIN_KEYOUT_SPACE) {
+        if (requests->size - requests->filled < MIN_KEYOUT_SPACE) {
             break;
         }
 
@@ -216,16 +216,16 @@ static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *d
             keys->consumed = 0;
             // Toss a nop to cap off the key write
             if (keys->complete == 0) {
-                char *data = data_cmds->buf + data_cmds->filled;
+                char *data = requests->buf + requests->filled;
                 memcpy(data, "mn\r\n", 4);
-                data_cmds->filled += 4;
+                requests->filled += 4;
                 keys->complete = 1;
             }
             break;
         }
 
         char *sdata;
-        char *data = sdata = data_cmds->buf + data_cmds->filled;
+        char *data = sdata = requests->buf + requests->filled;
         // copy base command but don't copy the \r\n
         memcpy(data, start, len-1);
         keys->consumed += len+1; // get the \n
@@ -234,7 +234,7 @@ static void dumplist_to_data_write(struct mcdump_buf *keys, struct mcdump_buf *d
         memcpy(data, MGDUMP_FLAGS, sizeof(MGDUMP_FLAGS)-1);
         data += sizeof(MGDUMP_FLAGS)-1;
 
-        data_cmds->filled += data - sdata;
+        requests->filled += data - sdata;
         //fprintf(stderr, "Copied command: %.*s\n", (int)(data - sdata)-1, sdata);
 
         // ran out of keys to copy.
@@ -437,34 +437,34 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
 }
 
 // TODO: max pipelines per fetch?
-static void run_data_out(int keyout_fd, struct mcdump_buf *keys, struct mcdump_buf *keyout) {
+static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump_buf *requests) {
     // Do we have anything to write?
-    if (keyout->filled <= keyout->consumed) {
+    if (requests->filled <= requests->consumed) {
         // No key data to work with right now.
         if (keys->filled <= keys->consumed) {
             return;
         }
 
-        // Fill new key data.
-        dumplist_to_data_write(keys, keyout);
+        // Fill new request data.
+        keylist_to_requests(keys, requests);
     }
 
-    if (keyout->filled > keyout->consumed) {
-        keyout->want_writepoll = 0;
-        int sent = send(keyout_fd, keyout->buf + keyout->consumed, keyout->filled - keyout->consumed, 0);
+    if (requests->filled > requests->consumed) {
+        requests->want_writepoll = 0;
+        int sent = send(reqs_fd, requests->buf + requests->consumed, requests->filled - requests->consumed, 0);
         if (sent == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                keyout->want_writepoll = 1;
+                requests->want_writepoll = 1;
             } else {
                 fprintf(stderr, "ERROR: key list connection closed\n");
                 exit(1);
             }
         } else {
-            keyout->consumed += sent;
+            requests->consumed += sent;
             // We've sent the full buffer.
-            if (keyout->consumed == keyout->filled) {
-                keyout->consumed = 0;
-                keyout->filled = 0;
+            if (requests->consumed == requests->filled) {
+                requests->consumed = 0;
+                requests->filled = 0;
             }
         }
     }
@@ -547,7 +547,7 @@ static int is_work_complete(struct mcdump_buf *keys,
 static int run_dump(struct mcdump_conf *conf) {
     struct pollfd to_poll[3];
     struct mcdump_buf keys_buf = {0};
-    struct mcdump_buf keys_out_buf = {0};
+    struct mcdump_buf requests_buf = {0};
     struct mcdump_buf data_read_buf = {0};
     struct mcdump_bwlim bwlimit = {0};
 
@@ -555,20 +555,20 @@ static int run_dump(struct mcdump_conf *conf) {
     bwlimit.remain = bwlimit.limit; // seed the limiter.
 
     int keys_fd = dump_connect(conf->source_host, conf->source_port);
-    int kout_fd = dump_connect(conf->source_host, conf->source_port);
+    int reqs_fd = dump_connect(conf->source_host, conf->source_port);
     int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
 
     to_poll[POLL_KEYS].fd = keys_fd;
     to_poll[POLL_KEYS].events = 0;
-    to_poll[POLL_KEYOUT].fd = kout_fd;
+    to_poll[POLL_KEYOUT].fd = reqs_fd;
     to_poll[POLL_KEYOUT].events = 0;
     to_poll[POLL_DEST].fd = dest_fd;
     to_poll[POLL_DEST].events = 0;
 
     keys_buf.buf = malloc(KEYSBUF_SIZE);
     keys_buf.size = KEYSBUF_SIZE;
-    keys_out_buf.buf = malloc(DATA_WRITEBUF_SIZE);
-    keys_out_buf.size = DATA_WRITEBUF_SIZE;
+    requests_buf.buf = malloc(DATA_WRITEBUF_SIZE);
+    requests_buf.size = DATA_WRITEBUF_SIZE;
     data_read_buf.buf = malloc(conf->read_bufsize);
     data_read_buf.size = conf->read_bufsize;
 
@@ -600,12 +600,12 @@ static int run_dump(struct mcdump_conf *conf) {
     while (1) {
         int do_poll = 0;
         // fetch more keys to convert if we have room for it.
-        if (keys_out_buf.size - keys_out_buf.filled > MIN_KEYOUT_SPACE) {
+        if (requests_buf.size - requests_buf.filled > MIN_KEYOUT_SPACE) {
             run_keys(keys_fd, &keys_buf);
         }
 
-        run_data_out(kout_fd, &keys_buf, &keys_out_buf);
-        run_data_in(kout_fd, &data_read_buf);
+        run_requests_out(reqs_fd, &keys_buf, &requests_buf);
+        run_data_in(reqs_fd, &data_read_buf);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
 
         // Set polling for next round.
@@ -613,11 +613,11 @@ static int run_dump(struct mcdump_conf *conf) {
             to_poll[POLL_KEYS].events = POLLIN;
             do_poll = 1;
         }
-        if (keys_out_buf.want_writepoll) {
+        if (requests_buf.want_writepoll) {
             to_poll[POLL_KEYOUT].events |= POLLOUT;
             do_poll = 1;
         }
-        if (keys_out_buf.want_readpoll) {
+        if (requests_buf.want_readpoll) {
             to_poll[POLL_KEYOUT].events |= POLLIN;
             do_poll = 1;
         }
@@ -626,7 +626,7 @@ static int run_dump(struct mcdump_conf *conf) {
             do_poll = 1;
         }
 
-        if (is_work_complete(&keys_buf, &data_read_buf, &keys_out_buf)) {
+        if (is_work_complete(&keys_buf, &data_read_buf, &requests_buf)) {
             fprintf(stderr, "Dumpload complete\n");
             break;
         }
@@ -661,7 +661,7 @@ static int run_dump(struct mcdump_conf *conf) {
     }
 
     close(keys_fd);
-    close(kout_fd);
+    close(reqs_fd);
 
     return EXIT_SUCCESS;
 }
