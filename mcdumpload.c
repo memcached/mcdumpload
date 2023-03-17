@@ -112,13 +112,16 @@ struct mcdump_conf {
     char dest_host[NI_MAXHOST];
     char dest_port[NI_MAXSERV];
     uint32_t dest_bwlimit; // kilobytes per timeslice
+    uint32_t src_reqlimit; // requests per timeslice
     uint32_t read_bufsize; // megabytes
 };
 
-struct mcdump_bwlim {
+struct mcdump_limiter {
     uint32_t limit; // kilobytes per timeslice
     int32_t remain; // bytes remaining for this next window
-    struct timeval window_end; // the enxt of the next window
+    uint32_t reqlimit; // requests per timeslice
+    int32_t reqremain; // requests remaining for this next window
+    struct timeval window_end; // the end of the next window
 };
 
 struct mcdump_buf {
@@ -137,18 +140,40 @@ struct mcdump_buf {
 // if window and remain is <= 0, sleep until window and reset window
 // if window and remain is <= 0 and window is in the past, just set window
 #define WINDOW_LENGTH 100000 // 1/10th of a sec
-static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
-    struct timeval now;
-    struct timeval toadd = {.tv_sec = 0, .tv_usec = WINDOW_LENGTH};
-
+static void run_bwlimit(struct mcdump_limiter *l, int sent) {
     if (l->limit == 0)
         return;
 
     l->remain -= sent;
+}
+
+static void run_reqlimit(struct mcdump_limiter *l, int requests) {
+    if (l->reqlimit == 0)
+        return;
+
+    l->reqremain -= requests;
+}
+
+static void run_limiter(struct mcdump_limiter *l) {
+    struct timeval now;
+    struct timeval toadd = {.tv_sec = 0, .tv_usec = WINDOW_LENGTH};
+    int wait = 0;
+
+    if (l->limit != 0 && l->remain <= 0) {
+        wait = 1;
+    }
+    if (l->reqlimit != 0 && l->reqremain <= 0) {
+        wait = 1;
+    }
+
+    if (wait == 0)
+        return;
+
     gettimeofday(&now, NULL);
 
-    if (l->remain <= 0) {
+    if (l->remain <= 0 || l->reqlimit <= 0) {
         l->remain = l->limit;
+        l->reqremain = l->reqlimit;
         if (l->window_end.tv_sec == 0 && l->window_end.tv_usec == 0) {
             usleep(WINDOW_LENGTH);
             gettimeofday(&now, NULL);
@@ -187,11 +212,17 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
 // apply rate limiter here?
 // would allow avoiding memove of data_cmds buf since we just wait for it to
 // drain
-static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requests) {
+static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requests,
+        struct mcdump_limiter *l) {
     // loop:
     // memchr to find \n in keys.buf + consumed
     // if found, and enough space in data_cmds.buf + filled, copy + add flags
     // if not found or space full, advance dump consumed
+    int limit = PIPELINES_DEFAULT;
+    int count = 0;
+    if (l->reqlimit != 0 && l->reqremain < limit) {
+        limit = l->reqremain;
+    }
     for (int x = 0; x < PIPELINES_DEFAULT; x++) {
         char *start = keys->buf + keys->consumed;
         char *end = memchr(keys->buf + keys->consumed, '\n',
@@ -238,6 +269,7 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
 
         requests->filled += data - sdata;
         requests->pending++;
+        count++;
         //fprintf(stderr, "Copied command: %.*s\n", (int)(data - sdata)-1, sdata);
 
         // ran out of keys to copy.
@@ -247,6 +279,7 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
             break;
         }
     }
+    run_reqlimit(l, count);
 }
 
 #define TEMP_SIZE 512
@@ -442,7 +475,8 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
     }
 }
 
-static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump_buf *requests) {
+static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump_buf *requests,
+        struct mcdump_limiter *l) {
     // Flush previous buffer and read responses before requesting more
     // TODO: when enforced, waits for all responses before sending more
     // requests, but seems to 8x the CPU usage of the dumploader.
@@ -454,7 +488,7 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
         }
 
         // Fill new request data.
-        keylist_to_requests(keys, requests);
+        keylist_to_requests(keys, requests, l);
     }
 
     if (requests->filled > requests->consumed) {
@@ -498,7 +532,7 @@ static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf 
     }
 }
 
-static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_bwlim *bwlimit) {
+static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_limiter *bwlimit) {
     // anything to write out?
     if (data_in->parsed <= data_in->consumed) {
         return;
@@ -558,10 +592,13 @@ static int run_dump(struct mcdump_conf *conf) {
     struct mcdump_buf keys_buf = {0};
     struct mcdump_buf requests_buf = {0};
     struct mcdump_buf data_read_buf = {0};
-    struct mcdump_bwlim bwlimit = {0};
+    struct mcdump_limiter bwlimit = {0};
 
     bwlimit.limit = conf->dest_bwlimit;
+    bwlimit.reqlimit = conf->src_reqlimit;
+
     bwlimit.remain = bwlimit.limit; // seed the limiter.
+    bwlimit.reqremain = bwlimit.reqlimit;
 
     int keys_fd = dump_connect(conf->source_host, conf->source_port);
     int reqs_fd = dump_connect(conf->source_host, conf->source_port);
@@ -613,7 +650,7 @@ static int run_dump(struct mcdump_conf *conf) {
             run_keys(keys_fd, &keys_buf);
         }
 
-        run_requests_out(reqs_fd, &keys_buf, &requests_buf);
+        run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit);
         run_data_in(reqs_fd, &data_read_buf, &requests_buf);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
 
@@ -640,6 +677,7 @@ static int run_dump(struct mcdump_conf *conf) {
             break;
         }
 
+        run_limiter(&bwlimit); // pause if necessary
         if (do_poll) {
             // TODO: check POLLHUP/etc
             int ret = poll(to_poll, 3, 1000);
@@ -681,6 +719,7 @@ static void usage(void) {
            "--srcport=<port> (11211)\n"
            "--dstip=<addr> (no default)\n"
            "--dstport=<port> (no default)\n"
+           "--srcratelimit=<requests/sec> (0)\n"
            "--dstbwlimit=<kilobits/sec> (0)\n"
            "--readbufsize=<megabytes> (2)\n"
           );
@@ -690,7 +729,8 @@ static void usage(void) {
 // - add a "stdout" mode
 int main(int argc, char **argv) {
     struct mcdump_conf conf = {.source_host = "127.0.0.1", .source_port = "11211",
-                               .dest_bwlimit = 0, .read_bufsize = DATA_READBUF_DEFAULT};
+                               .dest_bwlimit = 0, .src_reqlimit = 0,
+                               .read_bufsize = DATA_READBUF_DEFAULT};
     int dest_host = 0;
     int dest_port = 0;
     const struct option longopts[] = {
@@ -699,6 +739,7 @@ int main(int argc, char **argv) {
         {"dstip", required_argument, 0, 'd'},
         {"dstport", required_argument, 0, 's'},
         {"dstbwlimit", required_argument, 0, 'l'},
+        {"srcratelimit", required_argument, 0, 'r'},
         {"readbufsize", required_argument, 0, 'b'},
         {"help", no_argument, 0, 'h'},
         // end
@@ -725,6 +766,9 @@ int main(int argc, char **argv) {
         case 'l':
             conf.dest_bwlimit = atoi(optarg);
             break;
+        case 'r':
+            conf.src_reqlimit = atoi(optarg);
+            break;
         case 'b':
             conf.read_bufsize = atoi(optarg) * (1024 * 1024);
             break;
@@ -748,6 +792,14 @@ int main(int argc, char **argv) {
         int64_t bytes_sec = bits_sec / 8;
         // ultimately bytes per time slice.
         conf.dest_bwlimit = bytes_sec / 10;
+    }
+
+    if (conf.src_reqlimit) {
+        if (conf.src_reqlimit > 10) {
+            conf.src_reqlimit /= 10;
+        } else {
+            conf.src_reqlimit = 0;
+        }
     }
 
     return run_dump(&conf);
