@@ -95,6 +95,7 @@ end:
 }
 
 static void poll_for(struct pollfd *to_poll, int idx, int flag) {
+    to_poll[idx].events = flag;
     while (1) {
         int ret = poll(to_poll, 3, 1000);
         if (ret == 0)
@@ -127,6 +128,8 @@ struct mcdump_buf {
     int consumed;
     int parsed; // used just for the data transformer
     int complete; // 0 or 1 to indicate if this stream has completed.
+    int want_readpoll;
+    int want_writepoll;
 };
 
 // if window is zero and remain is zero, just sleep for window length
@@ -176,7 +179,7 @@ static void run_bwlimit(struct mcdump_bwlim *l, int sent) {
 #define MGDUMP_FLAGS " k f t v q u Oo\r\n"
 #define KEYSBUF_SIZE 65536
 #define DATA_WRITEBUF_SIZE KEYSBUF_SIZE * 2
-#define DATA_READBUF_DEFAULT (1024 * 2)
+#define DATA_READBUF_DEFAULT (1024 * 1024 * 2)
 #define MIN_KEYOUT_SPACE 1024
 
 // apply rate limiter here?
@@ -404,8 +407,6 @@ static void convert_data_in(struct mcdump_buf *data_in) {
     if (data_in->filled < data_in->parsed) {
         abort();
     }
-
-
 }
 
 static void run_keys(int keys_fd, struct mcdump_buf *keys) {
@@ -421,48 +422,70 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
         }
     }
 
+    keys->want_readpoll = 0;
     int read = recv(keys_fd, keys->buf + keys->filled, keys->size - keys->filled, 0);
-    // TODO: check read result for error.
-    keys->filled += read;
+    if (read == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            keys->want_readpoll = 1;
+        } else {
+            fprintf(stderr, "ERROR: key list connection closed\n");
+            exit(1);
+        }
+    } else {
+        keys->filled += read;
+    }
 }
 
 // TODO: max pipelines per fetch?
-static void run_data_out(int data_fd, struct mcdump_buf *keys, struct mcdump_buf *data) {
+static void run_data_out(int keyout_fd, struct mcdump_buf *keys, struct mcdump_buf *keyout) {
     // Do we have anything to write?
-    if (data->filled <= data->consumed) {
+    if (keyout->filled <= keyout->consumed) {
         // No key data to work with right now.
         if (keys->filled <= keys->consumed) {
             return;
         }
 
         // Fill new key data.
-        dumplist_to_data_write(keys, data);
+        dumplist_to_data_write(keys, keyout);
     }
 
-    // TODO: Detect disconnect
-    if (data->filled > data->consumed) {
-        int sent = send(data_fd, data->buf + data->consumed, data->filled - data->consumed, 0);
-        if (sent < 0) {
-            abort();
+    if (keyout->filled > keyout->consumed) {
+        keyout->want_writepoll = 0;
+        int sent = send(keyout_fd, keyout->buf + keyout->consumed, keyout->filled - keyout->consumed, 0);
+        if (sent == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                keyout->want_writepoll = 1;
+            } else {
+                fprintf(stderr, "ERROR: key list connection closed\n");
+                exit(1);
+            }
+        } else {
+            keyout->consumed += sent;
+            // We've sent the full buffer.
+            if (keyout->consumed == keyout->filled) {
+                keyout->consumed = 0;
+                keyout->filled = 0;
+            }
         }
-        data->consumed += sent;
-    }
-
-    // We've sent the full buffer.
-    if (data->consumed == data->filled) {
-        data->consumed = 0;
-        data->filled = 0;
     }
 }
 
 static void run_data_in(int data_fd, struct mcdump_buf *data) {
     // if space, read as much as we can
     if (data->filled < data->size) {
+        data->want_readpoll = 0;
         int read = recv(data_fd, data->buf + data->filled, data->size - data->filled, 0);
-        // TODO: check read result for error.
-        data->filled += read;
-
-        convert_data_in(data);
+        if (read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                data->want_readpoll = 1;
+            } else {
+                fprintf(stderr, "ERROR: key list connection closed\n");
+                exit(1);
+            }
+        } else {
+            data->filled += read;
+            convert_data_in(data);
+        }
     }
 }
 
@@ -477,11 +500,19 @@ static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_
         tosend = bwlimit->remain;
     }
 
+    data_in->want_writepoll = 0;
     int sent = send(dest_fd, data_in->buf + data_in->consumed, tosend, 0);
-    // TODO: check result for error.
-    data_in->consumed += sent;
-
-    run_bwlimit(bwlimit, sent);
+    if (sent == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            data_in->want_writepoll = 1;
+        } else {
+            fprintf(stderr, "ERROR: key list connection closed\n");
+            exit(1);
+        }
+    } else {
+        data_in->consumed += sent;
+        run_bwlimit(bwlimit, sent);
+    }
 
     if (data_in->consumed == data_in->parsed) {
         // shift a partial buffer.
@@ -528,11 +559,11 @@ static int run_dump(struct mcdump_conf *conf) {
     int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
 
     to_poll[POLL_KEYS].fd = keys_fd;
-    to_poll[POLL_KEYS].events = POLLIN;
+    to_poll[POLL_KEYS].events = 0;
     to_poll[POLL_KEYOUT].fd = kout_fd;
-    to_poll[POLL_KEYOUT].events = POLLIN|POLLOUT;
+    to_poll[POLL_KEYOUT].events = 0;
     to_poll[POLL_DEST].fd = dest_fd;
-    to_poll[POLL_DEST].events = POLLIN|POLLOUT;
+    to_poll[POLL_DEST].events = 0;
 
     keys_buf.buf = malloc(KEYSBUF_SIZE);
     keys_buf.size = KEYSBUF_SIZE;
@@ -567,28 +598,32 @@ static int run_dump(struct mcdump_conf *conf) {
 
     // core loop
     while (1) {
-        // TODO: check POLLHUP/etc
-        int ret = poll(to_poll, 3, 1000);
-        if (ret < 0) {
-            abort();
-        }
-        if (ret == 0)
-            continue; // timeout
-
-        if (to_poll[POLL_KEYS].revents & POLLIN) {
+        int do_poll = 0;
+        // fetch more keys to convert if we have room for it.
+        if (keys_out_buf.size - keys_out_buf.filled > MIN_KEYOUT_SPACE) {
             run_keys(keys_fd, &keys_buf);
         }
 
-        if (to_poll[POLL_KEYOUT].revents & POLLOUT) {
-            run_data_out(kout_fd, &keys_buf, &keys_out_buf);
-        }
+        run_data_out(kout_fd, &keys_buf, &keys_out_buf);
+        run_data_in(kout_fd, &data_read_buf);
+        run_dest_out(dest_fd, &data_read_buf, &bwlimit);
 
-        if (to_poll[POLL_KEYOUT].revents & POLLIN) {
-            run_data_in(kout_fd, &data_read_buf);
+        // Set polling for next round.
+        if (keys_buf.want_readpoll) {
+            to_poll[POLL_KEYS].events = POLLIN;
+            do_poll = 1;
         }
-
-        if (to_poll[POLL_DEST].revents & POLLOUT) {
-            run_dest_out(dest_fd, &data_read_buf, &bwlimit);
+        if (keys_out_buf.want_writepoll) {
+            to_poll[POLL_KEYOUT].events |= POLLOUT;
+            do_poll = 1;
+        }
+        if (keys_out_buf.want_readpoll) {
+            to_poll[POLL_KEYOUT].events |= POLLIN;
+            do_poll = 1;
+        }
+        if (data_read_buf.want_writepoll) {
+            to_poll[POLL_DEST].events = POLLIN|POLLOUT;
+            do_poll = 1;
         }
 
         if (is_work_complete(&keys_buf, &data_read_buf, &keys_out_buf)) {
@@ -596,32 +631,17 @@ static int run_dump(struct mcdump_conf *conf) {
             break;
         }
 
-        // Set polling for next round.
-        // If there's no space in the keys buffer, don't keep checking read.
-        if (keys_buf.filled < keys_buf.size
-                && keys_out_buf.size - keys_out_buf.filled > MIN_KEYOUT_SPACE) {
-            to_poll[POLL_KEYS].events = POLLIN;
-        } else {
-            to_poll[POLL_KEYS].events = 0;
-        }
-
-        // If we have no keys to move to the key out buffer, and no data
-        // currently being flushed to the data in fd, don't poll.
-        if (keys_buf.filled <= keys_buf.consumed
-                && keys_out_buf.size - keys_out_buf.filled < MIN_KEYOUT_SPACE) {
-            to_poll[POLL_KEYOUT].events = 0;
-        } else if (data_read_buf.size == data_read_buf.filled) {
-            // destination buffer is full, wait before fetching more keys.
-            to_poll[POLL_KEYOUT].events = 0;
-        } else {
-            to_poll[POLL_KEYOUT].events = POLLIN|POLLOUT;
-        }
-
-        // If there's no converted data to for the destination, don't poll.
-        if (data_read_buf.parsed <= data_read_buf.consumed) {
-            to_poll[POLL_DEST].events = 0;
-        } else {
-            to_poll[POLL_DEST].events = POLLIN|POLLOUT;
+        if (do_poll) {
+            // TODO: check POLLHUP/etc
+            int ret = poll(to_poll, 3, 1000);
+            if (ret < 0) {
+                abort();
+            }
+            for (int x = 0; x <= POLL_DEST; x++) {
+                to_poll[x].events = 0;
+            }
+            if (ret == 0) // FIXME: just loop poll?
+                continue; // timeout
         }
     }
 
@@ -701,7 +721,7 @@ int main(int argc, char **argv) {
             break;
         case 'h':
             usage();
-            exit(EXIT_SUCCESS);
+            return EXIT_SUCCESS;
             break;
         default:
             fprintf(stderr, "Unknown option\n");
