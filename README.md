@@ -10,3 +10,12 @@ to run: `./mcdumpload --help`
 - Avoids tracking final state by sending MN commands to source and destination when streaming data is complete.
 - Minimizes processing within mcdumpload: avoids memory copying of value data. Edits metaget responses into metasets and forwards buffer to destination host.
 
+## Usage
+
+For including or excluding keys, use `--keyinclude` and `--keyexclude`
+filters.
+
+- The first filter specified sets whether or not all keys must be "included"
+  or "excluded"
+- Multiple filters may be specified: `--keyinclude="/foo" --keyinclude="bar"`
+- Can exlcude a subset of keys: `--keyinclude="/foo/" --keyexclude="/foo/bar/"`

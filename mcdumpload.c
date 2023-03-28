@@ -114,6 +114,7 @@ struct mcdump_conf {
     uint32_t dest_bwlimit; // kilobytes per timeslice
     uint32_t src_reqlimit; // requests per timeslice
     uint32_t read_bufsize; // megabytes
+    struct mcdump_filter *filter;
 };
 
 struct mcdump_limiter {
@@ -134,6 +135,16 @@ struct mcdump_buf {
     int complete; // 0 or 1 to indicate if this stream has completed.
     int want_readpoll;
     int want_writepoll;
+};
+
+#define FILTER_MAX_LEN 500
+#define FILTER_MODE_INCLUDE 1
+#define FILTER_MODE_EXCLUDE 0
+struct mcdump_filter {
+    char filter[FILTER_MAX_LEN];
+    int len;
+    int mode; // 0 exclude, 1 include
+    struct mcdump_filter *next; // next key filter to test.
 };
 
 // if window is zero and remain is zero, just sleep for window length
@@ -213,7 +224,7 @@ static void run_limiter(struct mcdump_limiter *l) {
 // would allow avoiding memove of data_cmds buf since we just wait for it to
 // drain
 static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requests,
-        struct mcdump_limiter *l) {
+        struct mcdump_limiter *l, struct mcdump_filter *f) {
     // loop:
     // memchr to find \n in keys.buf + consumed
     // if found, and enough space in data_cmds.buf + filled, copy + add flags
@@ -259,18 +270,49 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
 
         char *sdata;
         char *data = sdata = requests->buf + requests->filled;
-        // copy base command but don't copy the \r\n
-        memcpy(data, start, len-1);
-        keys->consumed += len+1; // get the \n
-        data += len-1;
 
-        memcpy(data, MGDUMP_FLAGS, sizeof(MGDUMP_FLAGS)-1);
-        data += sizeof(MGDUMP_FLAGS)-1;
+        struct mcdump_filter *cf = f;
+        // the first filter given sets the default include or exclude.
+        int use_key = 1;
+        if (cf) {
+            if (cf->mode == FILTER_MODE_INCLUDE) {
+                use_key = 0; // key must be included.
+            } else {
+                use_key = 1;
+            }
+        }
+        // TODO: Need temporary buffer and base64 decoder to filter binary.
+        while (cf) {
+            if (strncmp(start + 3, cf->filter, cf->len) == 0) {
+                if (cf->mode == FILTER_MODE_INCLUDE) {
+                    use_key = 1;
+                } else if (cf->mode == FILTER_MODE_EXCLUDE) {
+                    use_key = 0;
+                }
+            }
 
-        requests->filled += data - sdata;
-        requests->pending++;
-        count++;
-        //fprintf(stderr, "Copied command: %.*s\n", (int)(data - sdata)-1, sdata);
+            cf = cf->next;
+        }
+
+        if (use_key) {
+            // copy base command but don't copy the \r\n
+            memcpy(data, start, len-1);
+            keys->consumed += len+1; // get the \n
+            data += len-1;
+
+            memcpy(data, MGDUMP_FLAGS, sizeof(MGDUMP_FLAGS)-1);
+            data += sizeof(MGDUMP_FLAGS)-1;
+
+            requests->filled += data - sdata;
+            requests->pending++;
+            count++;
+            //fprintf(stderr, "Copied command: %.*s\n", (int)(data - sdata)-1, sdata);
+        } else {
+            // ignore this key and move on.
+            keys->consumed += len+1;
+            // give another chance to pipeline something else.
+            x--;
+        }
 
         // ran out of keys to copy.
         if (keys->consumed == keys->filled) {
@@ -476,7 +518,7 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
 }
 
 static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump_buf *requests,
-        struct mcdump_limiter *l) {
+        struct mcdump_limiter *l, struct mcdump_filter *f) {
     // Flush previous buffer and read responses before requesting more
     // TODO: when enforced, waits for all responses before sending more
     // requests, but seems to 8x the CPU usage of the dumploader.
@@ -488,7 +530,7 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
         }
 
         // Fill new request data.
-        keylist_to_requests(keys, requests, l);
+        keylist_to_requests(keys, requests, l, f);
     }
 
     if (requests->filled > requests->consumed) {
@@ -650,7 +692,7 @@ static int run_dump(struct mcdump_conf *conf) {
             run_keys(keys_fd, &keys_buf);
         }
 
-        run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit);
+        run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
         run_data_in(reqs_fd, &data_read_buf, &requests_buf);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
 
@@ -722,6 +764,8 @@ static void usage(void) {
            "--srcratelimit=<requests/sec> (0)\n"
            "--dstbwlimit=<kilobits/sec> (0)\n"
            "--readbufsize=<megabytes> (2)\n"
+           "--keyinclude=<prefix> ("")\n"
+           "--keyexclude=<prefix> ("")\n"
           );
 }
 
@@ -733,6 +777,8 @@ int main(int argc, char **argv) {
                                .read_bufsize = DATA_READBUF_DEFAULT};
     int dest_host = 0;
     int dest_port = 0;
+    struct mcdump_filter *filter = NULL;
+    struct mcdump_filter *curfilter = NULL;
     const struct option longopts[] = {
         {"srcip", required_argument, 0, 'i'},
         {"srcport", required_argument, 0, 'p'},
@@ -741,6 +787,8 @@ int main(int argc, char **argv) {
         {"dstbwlimit", required_argument, 0, 'l'},
         {"srcratelimit", required_argument, 0, 'r'},
         {"readbufsize", required_argument, 0, 'b'},
+        {"keyinclude", required_argument, 0, 'k'},
+        {"keyexclude", required_argument, 0, 'x'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -772,6 +820,30 @@ int main(int argc, char **argv) {
         case 'b':
             conf.read_bufsize = atoi(optarg) * (1024 * 1024);
             break;
+        case 'k':
+            if (curfilter) {
+                curfilter->next = calloc(1, sizeof(struct mcdump_filter));
+                curfilter = curfilter->next;
+            } else {
+                filter = calloc(1, sizeof(struct mcdump_filter));
+                curfilter = filter;
+            }
+            curfilter->len = strlen(optarg);
+            curfilter->mode = FILTER_MODE_INCLUDE;
+            strncpy(curfilter->filter, optarg, FILTER_MAX_LEN-1);
+            break;
+        case 'x':
+            if (curfilter) {
+                curfilter->next = calloc(1, sizeof(struct mcdump_filter));
+                curfilter = curfilter->next;
+            } else {
+                filter = calloc(1, sizeof(struct mcdump_filter));
+                curfilter = filter;
+            }
+            curfilter->len = strlen(optarg);
+            curfilter->mode = FILTER_MODE_EXCLUDE;
+            strncpy(curfilter->filter, optarg, FILTER_MAX_LEN-1);
+            break;
         case 'h':
             usage();
             return EXIT_SUCCESS;
@@ -781,6 +853,8 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
     }
+
+    conf.filter = filter;
 
     if (dest_host == 0 || dest_port == 0) {
         fprintf(stderr, "Arguments require at least '--dstip and --dstport'");
