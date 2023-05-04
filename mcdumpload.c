@@ -111,6 +111,7 @@ struct mcdump_stats {
     uint64_t not_stored;
     uint64_t server_error;
     uint64_t requests;
+    struct timeval next_check;
 };
 
 struct mcdump_conf {
@@ -118,10 +119,13 @@ struct mcdump_conf {
     char source_port[NI_MAXSERV];
     char dest_host[NI_MAXHOST];
     char dest_port[NI_MAXSERV];
+    char key_host[NI_MAXHOST];
+    char key_port[NI_MAXSERV];
     uint32_t dest_bwlimit; // kilobytes per timeslice
     uint32_t src_reqlimit; // requests per timeslice
     uint32_t read_bufsize; // megabytes
     int use_add; // use add instead of set
+    int show_stats; // print periodic stats
     struct mcdump_filter *filter;
 };
 
@@ -530,8 +534,13 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
         }
     }
 
-    int read = recv(keys_fd, keys->buf + keys->filled, keys->size - keys->filled, 0);
-    if (read == -1) {
+    int readb;
+    if (keys_fd == 0) {
+        readb = read(keys_fd, keys->buf + keys->filled, keys->size - keys->filled);
+    } else {
+        readb = recv(keys_fd, keys->buf + keys->filled, keys->size - keys->filled, 0);
+    }
+    if (readb == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             keys->want_readpoll = 1;
         } else {
@@ -539,7 +548,7 @@ static void run_keys(int keys_fd, struct mcdump_buf *keys) {
             exit(1);
         }
     } else {
-        keys->filled += read;
+        keys->filled += readb;
     }
 }
 
@@ -566,7 +575,7 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 requests->want_writepoll = 1;
             } else {
-                fprintf(stderr, "ERROR: key list connection closed\n");
+                fprintf(stderr, "ERROR: source connection closed\n");
                 exit(1);
             }
         } else {
@@ -580,7 +589,8 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
     }
 }
 
-static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf *requests, int use_add) {
+static void run_data_in(int data_fd, struct mcdump_buf *data, 
+        struct mcdump_buf *requests, struct mcdump_stats *stats, int use_add) {
     // if space, read as much as we can
     if (data->filled < data->size) {
         data->want_readpoll = 0;
@@ -589,13 +599,14 @@ static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf 
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 data->want_readpoll = 1;
             } else {
-                fprintf(stderr, "ERROR: key list connection closed\n");
+                fprintf(stderr, "ERROR: data source connection closed\n");
                 exit(1);
             }
         } else {
             data->filled += read;
             int converted = convert_data_in(data, use_add);
             requests->pending -= converted;
+            stats->requests += converted;
         }
     }
 }
@@ -617,7 +628,7 @@ static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             data_in->want_writepoll = 1;
         } else {
-            fprintf(stderr, "ERROR: key list connection closed\n");
+            fprintf(stderr, "ERROR: destination connection closed\n");
             exit(1);
         }
     } else {
@@ -705,6 +716,27 @@ static void check_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump
     }
 }
 
+static void check_stats(struct mcdump_stats *stats, struct mcdump_stats *stats2) {
+    struct timeval now;
+    struct mcdump_stats s = {0};
+    gettimeofday(&now, NULL);
+    if (now.tv_sec <= stats->next_check.tv_sec) {
+        return;
+    }
+
+    s.not_stored = stats->not_stored - stats2->not_stored;
+    s.server_error = stats->server_error - stats2->server_error;
+    s.requests = stats->requests - stats2->requests;
+
+    fprintf(stderr, "===STATS=== NS: [%llu] SERVER_ERROR: [%llu] REQUESTS: [%llu]\n",
+            (unsigned long long)s.not_stored,
+            (unsigned long long)s.server_error,
+            (unsigned long long)s.requests);
+
+    stats->next_check = now;
+    *stats2 = *stats;
+}
+
 static int is_work_complete(struct mcdump_buf *keys,
                             struct mcdump_buf *data_read,
                             struct mcdump_buf *keys_out) {
@@ -733,14 +765,21 @@ static int run_dump(struct mcdump_conf *conf) {
     struct mcdump_buf dest_in_buf = {0};
     struct mcdump_limiter bwlimit = {0};
     struct mcdump_stats stats = {0};
+    struct mcdump_stats stats2 = {0};
 
+    gettimeofday(&stats.next_check, NULL);
     bwlimit.limit = conf->dest_bwlimit;
     bwlimit.reqlimit = conf->src_reqlimit;
 
     bwlimit.remain = bwlimit.limit; // seed the limiter.
     bwlimit.reqremain = bwlimit.reqlimit;
 
-    int keys_fd = dump_connect(conf->source_host, conf->source_port);
+    int keys_fd;
+    if (conf->key_host[0] == '-') {
+        keys_fd = 0;
+    } else {
+        keys_fd = dump_connect(conf->key_host, conf->key_port);
+    }
     int reqs_fd = dump_connect(conf->source_host, conf->source_port);
     int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
 
@@ -793,11 +832,14 @@ static int run_dump(struct mcdump_conf *conf) {
         }
 
         run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
-        run_data_in(reqs_fd, &data_read_buf, &requests_buf, conf->use_add);
+        run_data_in(reqs_fd, &data_read_buf, &requests_buf, &stats, conf->use_add);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
         // periodically check in on the destination so we can give interactive
         // statistics/errors.
         check_dest_in(dest_fd, &dest_in_buf, &stats);
+        if (conf->show_stats) {
+            check_stats(&stats, &stats2);
+        }
 
         // Set polling for next round.
         if (keys_buf.want_readpoll) {
@@ -862,12 +904,15 @@ static void usage(void) {
            "--srcport=<port> (11211)\n"
            "--dstip=<addr> (no default)\n"
            "--dstport=<port> (no default)\n"
+           "--keylistip=<addr> (srcip) ['-' for STDIN]\n"
+           "--keylistport=<port> (srcport)\n"
            "--srcratelimit=<requests/sec> (0)\n"
            "--dstbwlimit=<kilobits/sec> (0)\n"
            "--readbufsize=<megabytes> (2)\n"
            "--keyinclude=<prefix> ("")\n"
            "--keyexclude=<prefix> ("")\n"
            "--add (use meta adds instead of sets)\n"
+           "--stats (print some stats once per second to STDERR)\n"
           );
 }
 
@@ -875,10 +920,13 @@ static void usage(void) {
 // - add a "stdout" mode
 int main(int argc, char **argv) {
     struct mcdump_conf conf = {.source_host = "127.0.0.1", .source_port = "11211",
+                               .key_host = "127.0.0.1", .key_port = "11211",
                                .dest_bwlimit = 0, .src_reqlimit = 0, .use_add = 0,
                                .read_bufsize = DATA_READBUF_DEFAULT};
     int dest_host = 0;
     int dest_port = 0;
+    int key_host = 0;
+    int key_port = 0;
     struct mcdump_filter *filter = NULL;
     struct mcdump_filter *curfilter = NULL;
     const struct option longopts[] = {
@@ -886,12 +934,15 @@ int main(int argc, char **argv) {
         {"srcport", required_argument, 0, 'p'},
         {"dstip", required_argument, 0, 'd'},
         {"dstport", required_argument, 0, 's'},
+        {"keylistip", required_argument, 0, 'w'},
+        {"keylistport", required_argument, 0, 'e'},
         {"dstbwlimit", required_argument, 0, 'l'},
         {"srcratelimit", required_argument, 0, 'r'},
         {"readbufsize", required_argument, 0, 'b'},
         {"keyinclude", required_argument, 0, 'k'},
         {"keyexclude", required_argument, 0, 'x'},
         {"add", no_argument, 0, 'a'},
+        {"stats", no_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -905,9 +956,15 @@ int main(int argc, char **argv) {
             break;
         case 'i':
             strncpy(conf.source_host, optarg, NI_MAXHOST-1);
+            if (key_host == 0) {
+                strncpy(conf.key_host, optarg, NI_MAXHOST-1);
+            }
             break;
         case 'p':
             strncpy(conf.source_port, optarg, NI_MAXSERV-1);
+            if (key_port == 0) {
+                strncpy(conf.key_port, optarg, NI_MAXSERV-1);
+            }
             break;
         case 'd':
             strncpy(conf.dest_host, optarg, NI_MAXHOST-1);
@@ -916,6 +973,14 @@ int main(int argc, char **argv) {
         case 's':
             strncpy(conf.dest_port, optarg, NI_MAXSERV-1);
             dest_port = 1;
+            break;
+        case 'w':
+            strncpy(conf.key_host, optarg, NI_MAXHOST-1);
+            key_host = 1;
+            break;
+        case 'e':
+            strncpy(conf.key_port, optarg, NI_MAXSERV-1);
+            key_port = 1;
             break;
         case 'l':
             conf.dest_bwlimit = atoi(optarg);
@@ -949,6 +1014,9 @@ int main(int argc, char **argv) {
             curfilter->len = strlen(optarg);
             curfilter->mode = FILTER_MODE_EXCLUDE;
             strncpy(curfilter->filter, optarg, FILTER_MAX_LEN-1);
+            break;
+        case 't':
+            conf.show_stats = 1;
             break;
         case 'h':
             usage();
