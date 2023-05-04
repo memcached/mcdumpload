@@ -94,6 +94,7 @@ end:
     return sock;
 }
 
+// TODO: check for POLLHUP
 static void poll_for(struct pollfd *to_poll, int idx, int flag) {
     to_poll[idx].events = flag;
     while (1) {
@@ -106,6 +107,12 @@ static void poll_for(struct pollfd *to_poll, int idx, int flag) {
     }
 }
 
+struct mcdump_stats {
+    uint64_t not_stored;
+    uint64_t server_error;
+    uint64_t requests;
+};
+
 struct mcdump_conf {
     char source_host[NI_MAXHOST];
     char source_port[NI_MAXSERV];
@@ -114,6 +121,7 @@ struct mcdump_conf {
     uint32_t dest_bwlimit; // kilobytes per timeslice
     uint32_t src_reqlimit; // requests per timeslice
     uint32_t read_bufsize; // megabytes
+    int use_add; // use add instead of set
     struct mcdump_filter *filter;
 };
 
@@ -135,6 +143,7 @@ struct mcdump_buf {
     int complete; // 0 or 1 to indicate if this stream has completed.
     int want_readpoll;
     int want_writepoll;
+    struct timeval last_check; // for time based polling.
 };
 
 #define FILTER_MAX_LEN 500
@@ -211,10 +220,11 @@ static void run_limiter(struct mcdump_limiter *l) {
 // return the key, client flags, TTL remaining, value
 // quiet flag to skip EN\r\n's so we don't have to handle them.
 // u flag to not bump the LRU for all the items we're fetching.
-// Adds the Oo flag to be replaced by "q" so we can quiet set and have the
+// Adds the O flag to be replaced by new flags so we can have the
 // string line up.
-#define MGDUMP_FLAGS " k f t v q u Oo\r\n"
+#define MGDUMP_FLAGS " k f t v q u Ooooo\r\n"
 #define KEYSBUF_SIZE 65536
+#define DESTINBUF_SIZE 65536
 #define DATA_WRITEBUF_SIZE KEYSBUF_SIZE * 2
 #define DATA_READBUF_DEFAULT (1024 * 1024 * 2)
 #define MIN_KEYOUT_SPACE 1024
@@ -326,7 +336,7 @@ static void keylist_to_requests(struct mcdump_buf *keys, struct mcdump_buf *requ
 
 #define TEMP_SIZE 512
 
-static int convert_data_in(struct mcdump_buf *data_in) {
+static int convert_data_in(struct mcdump_buf *data_in, int use_add) {
     char temp[TEMP_SIZE];
     int temp_len = 0;
     int parsed = data_in->parsed;
@@ -461,13 +471,29 @@ static int convert_data_in(struct mcdump_buf *data_in) {
             p++;
         }
 
-        // we should have enough space left for "q" then "\r\n"
-        if (end - np < 3) {
+        // we should have enough space left for "q " then "\r\n"
+        if (end - np < 4) {
             fprintf(stderr, "ERROR: not enough space left to append q flag: %s\n", start);
             abort();
         }
 
         *np = 'q';
+        np++;
+        *np = ' ';
+        np++;
+
+        if (end - np < 4) {
+            fprintf(stderr, "ERROR: not enough space left to append M flag: %s\n", start);
+            abort();
+        }
+
+        *np = 'M';
+        np++;
+        if (use_add) {
+            *np = 'E';
+        } else {
+            *np = 'S';
+        }
         np++;
         while (*np != '\r') {
             *np = ' '; // blank out any remaining characters
@@ -554,7 +580,7 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
     }
 }
 
-static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf *requests) {
+static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf *requests, int use_add) {
     // if space, read as much as we can
     if (data->filled < data->size) {
         data->want_readpoll = 0;
@@ -568,7 +594,7 @@ static void run_data_in(int data_fd, struct mcdump_buf *data, struct mcdump_buf 
             }
         } else {
             data->filled += read;
-            int converted = convert_data_in(data);
+            int converted = convert_data_in(data, use_add);
             requests->pending -= converted;
         }
     }
@@ -613,6 +639,72 @@ static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_
     }
 }
 
+static int run_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump_stats *stats) {
+    int read = recv(dest_fd, dest_in->buf + dest_in->filled, dest_in->size - dest_in->filled, 0);
+    if (read == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // nothing to read right now.
+            return -1;
+        } else {
+            fprintf(stderr, "ERROR: destination connection closed\n");
+            exit(1);
+        }
+    }
+
+    dest_in->filled += read;
+    // TODO: how to "expect" the actual end of the stream?
+    // else we silently bail here if there's a missing newline but garbage on
+    // the line.
+    // add "expect_complete" flag argument?
+    // if read == 0 and something in the buffer and it's not MN print and die.
+    while (1) {
+        char *start = dest_in->buf;
+        char *end = memchr(dest_in->buf, '\n', dest_in->filled);
+        if (end == NULL) {
+            break;
+        }
+
+        int len = end - start + 1;
+
+        // We don't need to pre-check the length since we only look at the
+        // start of the buffer and it will always be longer than the test
+        // string.
+        if (strncmp(start, "NS\r\n", len) == 0) {
+            stats->not_stored++;
+        } else if (strncmp(start, "SERVER_ERROR", len) == 0) {
+            fprintf(stderr, "%.*s", len, start);
+            stats->server_error++;
+        } else if (strncmp(start, "CLIENT_ERROR", len) == 0) {
+            fprintf(stderr, "%.*s", len, start);
+            fprintf(stderr, "ERROR: received CLIENT_ERROR from destination, protocol is out of sync and must stop\n");
+            exit(1);
+        } else if (strncmp(start, "ERROR", len) == 0) {
+            fprintf(stderr, "%.*s", len, start);
+            fprintf(stderr, "ERROR: received ERROR from destination, protocol is out of sync and must stop\n");
+            exit(1);
+        } else if (strncmp(start, "MN\r\n", len) == 0) {
+            dest_in->complete = 1;
+        } else {
+            fprintf(stderr, "ERROR: Got unexpected response from destination: %.*s", len, start);
+            exit(1);
+        }
+        memmove(dest_in->buf, end+1, dest_in->filled - len);
+        dest_in->filled -= len;
+    }
+
+    return read;
+}
+
+static void check_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump_stats *stats) {
+    struct timeval now;
+
+    gettimeofday(&now, NULL);
+    if (dest_in->last_check.tv_sec != now.tv_sec) {
+        dest_in->last_check = now;
+        run_dest_in(dest_fd, dest_in, stats);
+    }
+}
+
 static int is_work_complete(struct mcdump_buf *keys,
                             struct mcdump_buf *data_read,
                             struct mcdump_buf *keys_out) {
@@ -631,10 +723,16 @@ static int is_work_complete(struct mcdump_buf *keys,
 
 static int run_dump(struct mcdump_conf *conf) {
     struct pollfd to_poll[3];
+    // for reading the list of keys
     struct mcdump_buf keys_buf = {0};
+    // for holding requests converted from the key list
     struct mcdump_buf requests_buf = {0};
+    // for reading data back from the source connection
     struct mcdump_buf data_read_buf = {0};
+    // for reading responses from the destination connection.
+    struct mcdump_buf dest_in_buf = {0};
     struct mcdump_limiter bwlimit = {0};
+    struct mcdump_stats stats = {0};
 
     bwlimit.limit = conf->dest_bwlimit;
     bwlimit.reqlimit = conf->src_reqlimit;
@@ -659,6 +757,8 @@ static int run_dump(struct mcdump_conf *conf) {
     requests_buf.size = DATA_WRITEBUF_SIZE;
     data_read_buf.buf = malloc(conf->read_bufsize);
     data_read_buf.size = conf->read_bufsize;
+    dest_in_buf.buf = malloc(DESTINBUF_SIZE);
+    dest_in_buf.size = DESTINBUF_SIZE;
 
     while (1) {
         int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
@@ -693,8 +793,11 @@ static int run_dump(struct mcdump_conf *conf) {
         }
 
         run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
-        run_data_in(reqs_fd, &data_read_buf, &requests_buf);
+        run_data_in(reqs_fd, &data_read_buf, &requests_buf, conf->use_add);
         run_dest_out(dest_fd, &data_read_buf, &bwlimit);
+        // periodically check in on the destination so we can give interactive
+        // statistics/errors.
+        check_dest_in(dest_fd, &dest_in_buf, &stats);
 
         // Set polling for next round.
         if (keys_buf.want_readpoll) {
@@ -715,7 +818,6 @@ static int run_dump(struct mcdump_conf *conf) {
         }
 
         if (is_work_complete(&keys_buf, &data_read_buf, &requests_buf)) {
-            fprintf(stderr, "Dumpload complete\n");
             break;
         }
 
@@ -726,6 +828,10 @@ static int run_dump(struct mcdump_conf *conf) {
             if (ret < 0) {
                 abort();
             }
+            // destination socket can block writes if we need to read.
+            if (to_poll[POLL_DEST].revents & POLLIN) {
+                run_dest_in(dest_fd, &dest_in_buf, &stats);
+            }
             for (int x = 0; x <= POLL_DEST; x++) {
                 to_poll[x].events = 0;
             }
@@ -735,17 +841,12 @@ static int run_dump(struct mcdump_conf *conf) {
     }
 
     while (1) {
-        poll_for(to_poll, POLL_DEST, POLLIN);
-        int read = recv(dest_fd, data_read_buf.buf + data_read_buf.filled,
-                data_read_buf.size - data_read_buf.filled, 0);
-        data_read_buf.filled += read;
-        if (data_read_buf.filled < 4)
-            continue;
-        if (strncmp(data_read_buf.buf, "MN\r\n", 4) == 0) {
+        run_dest_in(dest_fd, &dest_in_buf, &stats);
+        if (dest_in_buf.complete) {
+            fprintf(stderr, "Dumpload complete\n");
             break;
         } else {
-            fprintf(stderr, "ERROR: Got unexpected result from destination socket: %.*s\n",
-                    data_read_buf.filled, data_read_buf.buf);
+            poll_for(to_poll, POLL_DEST, POLLIN);
         }
     }
 
@@ -766,6 +867,7 @@ static void usage(void) {
            "--readbufsize=<megabytes> (2)\n"
            "--keyinclude=<prefix> ("")\n"
            "--keyexclude=<prefix> ("")\n"
+           "--add (use meta adds instead of sets)\n"
           );
 }
 
@@ -773,7 +875,7 @@ static void usage(void) {
 // - add a "stdout" mode
 int main(int argc, char **argv) {
     struct mcdump_conf conf = {.source_host = "127.0.0.1", .source_port = "11211",
-                               .dest_bwlimit = 0, .src_reqlimit = 0,
+                               .dest_bwlimit = 0, .src_reqlimit = 0, .use_add = 0,
                                .read_bufsize = DATA_READBUF_DEFAULT};
     int dest_host = 0;
     int dest_port = 0;
@@ -789,6 +891,7 @@ int main(int argc, char **argv) {
         {"readbufsize", required_argument, 0, 'b'},
         {"keyinclude", required_argument, 0, 'k'},
         {"keyexclude", required_argument, 0, 'x'},
+        {"add", no_argument, 0, 'a'},
         {"help", no_argument, 0, 'h'},
         // end
         {0, 0, 0, 0}
@@ -797,6 +900,9 @@ int main(int argc, char **argv) {
     int c;
     while (-1 != (c = getopt_long(argc, argv, "", longopts, &optindex))) {
         switch (c) {
+        case 'a':
+            conf.use_add = 1;
+            break;
         case 'i':
             strncpy(conf.source_host, optarg, NI_MAXHOST-1);
             break;
@@ -857,7 +963,7 @@ int main(int argc, char **argv) {
     conf.filter = filter;
 
     if (dest_host == 0 || dest_port == 0) {
-        fprintf(stderr, "Arguments require at least '--dstip and --dstport'");
+        fprintf(stderr, "Arguments require at least '--dstip and --dstport'\n");
         return EXIT_FAILURE;
     }
 
