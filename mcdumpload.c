@@ -570,10 +570,12 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
 
     if (requests->filled > requests->consumed) {
         requests->want_writepoll = 0;
+        requests->want_readpoll = 0;
         int sent = send(reqs_fd, requests->buf + requests->consumed, requests->filled - requests->consumed, 0);
         if (sent == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 requests->want_writepoll = 1;
+                requests->want_readpoll = 1; // read queue may be full.
             } else {
                 fprintf(stderr, "ERROR: source connection closed\n");
                 exit(1);
