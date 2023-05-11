@@ -591,22 +591,22 @@ static void run_requests_out(int reqs_fd, struct mcdump_buf *keys, struct mcdump
     }
 }
 
-static void run_data_in(int data_fd, struct mcdump_buf *data, 
+static void run_responses_in(int src_fd, struct mcdump_buf *responses,
         struct mcdump_buf *requests, struct mcdump_stats *stats, int use_add) {
     // if space, read as much as we can
-    if (data->filled < data->size) {
-        data->want_readpoll = 0;
-        int read = recv(data_fd, data->buf + data->filled, data->size - data->filled, 0);
+    if (responses->filled < responses->size) {
+        responses->want_readpoll = 0;
+        int read = recv(src_fd, responses->buf + responses->filled, responses->size - responses->filled, 0);
         if (read == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                data->want_readpoll = 1;
+                responses->want_readpoll = 1;
             } else {
                 fprintf(stderr, "ERROR: data source connection closed\n");
                 exit(1);
             }
         } else {
-            data->filled += read;
-            int converted = convert_data_in(data, use_add);
+            responses->filled += read;
+            int converted = convert_data_in(responses, use_add);
             requests->pending -= converted;
             stats->requests += converted;
         }
@@ -752,7 +752,7 @@ static int is_work_complete(struct mcdump_buf *keys,
 }
 
 #define POLL_KEYS 0
-#define POLL_KEYOUT 1
+#define POLL_SOURCE 1
 #define POLL_DEST 2
 
 static int run_dump(struct mcdump_conf *conf) {
@@ -761,8 +761,8 @@ static int run_dump(struct mcdump_conf *conf) {
     struct mcdump_buf keys_buf = {0};
     // for holding requests converted from the key list
     struct mcdump_buf requests_buf = {0};
-    // for reading data back from the source connection
-    struct mcdump_buf data_read_buf = {0};
+    // for reading responses back from the source connection
+    struct mcdump_buf responses_buf = {0};
     // for reading responses from the destination connection.
     struct mcdump_buf dest_in_buf = {0};
     struct mcdump_limiter bwlimit = {0};
@@ -782,13 +782,13 @@ static int run_dump(struct mcdump_conf *conf) {
     } else {
         keys_fd = dump_connect(conf->key_host, conf->key_port);
     }
-    int reqs_fd = dump_connect(conf->source_host, conf->source_port);
+    int src_fd = dump_connect(conf->source_host, conf->source_port);
     int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
 
     to_poll[POLL_KEYS].fd = keys_fd;
     to_poll[POLL_KEYS].events = 0;
-    to_poll[POLL_KEYOUT].fd = reqs_fd;
-    to_poll[POLL_KEYOUT].events = 0;
+    to_poll[POLL_SOURCE].fd = src_fd;
+    to_poll[POLL_SOURCE].events = 0;
     to_poll[POLL_DEST].fd = dest_fd;
     to_poll[POLL_DEST].events = 0;
 
@@ -796,8 +796,8 @@ static int run_dump(struct mcdump_conf *conf) {
     keys_buf.size = KEYSBUF_SIZE;
     requests_buf.buf = malloc(DATA_WRITEBUF_SIZE);
     requests_buf.size = DATA_WRITEBUF_SIZE;
-    data_read_buf.buf = malloc(conf->read_bufsize);
-    data_read_buf.size = conf->read_bufsize;
+    responses_buf.buf = malloc(conf->read_bufsize);
+    responses_buf.size = conf->read_bufsize;
     dest_in_buf.buf = malloc(DESTINBUF_SIZE);
     dest_in_buf.size = DESTINBUF_SIZE;
 
@@ -833,9 +833,9 @@ static int run_dump(struct mcdump_conf *conf) {
             run_keys(keys_fd, &keys_buf);
         }
 
-        run_requests_out(reqs_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
-        run_data_in(reqs_fd, &data_read_buf, &requests_buf, &stats, conf->use_add);
-        run_dest_out(dest_fd, &data_read_buf, &bwlimit);
+        run_requests_out(src_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
+        run_responses_in(src_fd, &responses_buf, &requests_buf, &stats, conf->use_add);
+        run_dest_out(dest_fd, &responses_buf, &bwlimit);
         // periodically check in on the destination so we can give interactive
         // statistics/errors.
         check_dest_in(dest_fd, &dest_in_buf, &stats);
@@ -849,19 +849,19 @@ static int run_dump(struct mcdump_conf *conf) {
             do_poll = 1;
         }
         if (requests_buf.want_writepoll) {
-            to_poll[POLL_KEYOUT].events |= POLLOUT;
+            to_poll[POLL_SOURCE].events |= POLLOUT;
             do_poll = 1;
         }
         if (requests_buf.want_readpoll) {
-            to_poll[POLL_KEYOUT].events |= POLLIN;
+            to_poll[POLL_SOURCE].events |= POLLIN;
             do_poll = 1;
         }
-        if (data_read_buf.want_writepoll) {
+        if (responses_buf.want_writepoll) {
             to_poll[POLL_DEST].events = POLLIN|POLLOUT;
             do_poll = 1;
         }
 
-        if (is_work_complete(&keys_buf, &data_read_buf, &requests_buf)) {
+        if (is_work_complete(&keys_buf, &responses_buf, &requests_buf)) {
             break;
         }
 
@@ -895,7 +895,7 @@ static int run_dump(struct mcdump_conf *conf) {
     }
 
     close(keys_fd);
-    close(reqs_fd);
+    close(src_fd);
 
     return EXIT_SUCCESS;
 }
