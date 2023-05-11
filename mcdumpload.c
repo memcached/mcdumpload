@@ -613,42 +613,42 @@ static void run_responses_in(int src_fd, struct mcdump_buf *responses,
     }
 }
 
-static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_limiter *bwlimit) {
+static void run_dest_out(int dest_fd, struct mcdump_buf *responses_in, struct mcdump_limiter *bwlimit) {
     // anything to write out?
-    if (data_in->parsed <= data_in->consumed) {
+    if (responses_in->parsed <= responses_in->consumed) {
         return;
     }
 
-    int tosend = data_in->parsed - data_in->consumed;
+    int tosend = responses_in->parsed - responses_in->consumed;
     if (bwlimit->limit != 0 && bwlimit->remain < tosend) {
         tosend = bwlimit->remain;
     }
 
-    data_in->want_writepoll = 0;
-    int sent = send(dest_fd, data_in->buf + data_in->consumed, tosend, 0);
+    responses_in->want_writepoll = 0;
+    int sent = send(dest_fd, responses_in->buf + responses_in->consumed, tosend, 0);
     if (sent == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            data_in->want_writepoll = 1;
+            responses_in->want_writepoll = 1;
         } else {
             fprintf(stderr, "ERROR: destination connection closed\n");
             exit(1);
         }
     } else {
-        data_in->consumed += sent;
+        responses_in->consumed += sent;
         run_bwlimit(bwlimit, sent);
     }
 
-    if (data_in->consumed == data_in->parsed) {
+    if (responses_in->consumed == responses_in->parsed) {
         // shift a partial buffer.
-        if (data_in->parsed < data_in->filled) {
-            memmove(data_in->buf, data_in->buf+data_in->parsed,
-                    data_in->filled - data_in->consumed);
-            data_in->filled = data_in->filled - data_in->consumed;
+        if (responses_in->parsed < responses_in->filled) {
+            memmove(responses_in->buf, responses_in->buf+responses_in->parsed,
+                    responses_in->filled - responses_in->consumed);
+            responses_in->filled = responses_in->filled - responses_in->consumed;
         } else {
-            data_in->filled = 0;
+            responses_in->filled = 0;
         }
-        data_in->consumed = 0;
-        data_in->parsed = 0;
+        responses_in->consumed = 0;
+        responses_in->parsed = 0;
     }
 }
 
