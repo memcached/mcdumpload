@@ -613,42 +613,73 @@ static void run_responses_in(int src_fd, struct mcdump_buf *responses,
     }
 }
 
-static void run_dest_out(int dest_fd, struct mcdump_buf *responses_in, struct mcdump_limiter *bwlimit) {
-    // anything to write out?
-    if (responses_in->parsed <= responses_in->consumed) {
+#define DEST_OUT_RES 512 // save some space or end capping chunks of responses
+
+// move converted responses from the resp buffer to destination buffer
+static void move_responses(struct mcdump_buf *responses, struct mcdump_buf *dest_out) {
+    if (responses->parsed <= responses->consumed) {
+        return;
+    }
+    if (dest_out->filled >= dest_out->size - DEST_OUT_RES) {
+        fprintf(stderr, "DEST FULL\n");
         return;
     }
 
-    int tosend = responses_in->parsed - responses_in->consumed;
+    int tocopy = responses->parsed - responses->consumed;
+    int remain = dest_out->size - dest_out->filled;
+    if (tocopy > remain) {
+        tocopy = remain;
+    }
+
+    memcpy(dest_out->buf + dest_out->filled,
+           responses->buf + responses->consumed,
+           tocopy);
+
+    responses->consumed += tocopy;
+    dest_out->filled += tocopy;
+
+    if (responses->consumed == responses->parsed) {
+        // shift a partial buffer.
+        if (responses->parsed < responses->filled) {
+            memmove(responses->buf, responses->buf+responses->parsed,
+                    responses->filled - responses->consumed);
+            responses->filled = responses->filled - responses->consumed;
+        } else {
+            responses->filled = 0;
+        }
+        responses->consumed = 0;
+        responses->parsed = 0;
+    }
+}
+
+static void run_dest_out(int dest_fd, struct mcdump_buf *dest_out, struct mcdump_limiter *bwlimit) {
+    // anything to write out?
+    if (dest_out->filled <= dest_out->consumed) {
+        return;
+    }
+
+    int tosend = dest_out->filled - dest_out->consumed;
     if (bwlimit->limit != 0 && bwlimit->remain < tosend) {
         tosend = bwlimit->remain;
     }
 
-    responses_in->want_writepoll = 0;
-    int sent = send(dest_fd, responses_in->buf + responses_in->consumed, tosend, 0);
+    dest_out->want_writepoll = 0;
+    int sent = send(dest_fd, dest_out->buf + dest_out->consumed, tosend, 0);
     if (sent == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            responses_in->want_writepoll = 1;
+            dest_out->want_writepoll = 1;
         } else {
             fprintf(stderr, "ERROR: destination connection closed\n");
             exit(1);
         }
     } else {
-        responses_in->consumed += sent;
+        dest_out->consumed += sent;
         run_bwlimit(bwlimit, sent);
     }
 
-    if (responses_in->consumed == responses_in->parsed) {
-        // shift a partial buffer.
-        if (responses_in->parsed < responses_in->filled) {
-            memmove(responses_in->buf, responses_in->buf+responses_in->parsed,
-                    responses_in->filled - responses_in->consumed);
-            responses_in->filled = responses_in->filled - responses_in->consumed;
-        } else {
-            responses_in->filled = 0;
-        }
-        responses_in->consumed = 0;
-        responses_in->parsed = 0;
+    if (dest_out->consumed == dest_out->filled) {
+        dest_out->consumed = 0;
+        dest_out->filled = 0;
     }
 }
 
@@ -742,10 +773,11 @@ static void check_stats(struct mcdump_stats *stats, struct mcdump_stats *stats2)
 }
 
 static int is_work_complete(struct mcdump_buf *keys,
-                            struct mcdump_buf *data_read,
-                            struct mcdump_buf *keys_out) {
+                            struct mcdump_buf *responses,
+                            struct mcdump_buf *keys_out,
+                            struct mcdump_buf *dest_out) {
     if (keys->complete == 1) {
-        if (data_read->complete == 1 && data_read->filled == 0) {
+        if (responses->complete == 1 && responses->filled == 0 && dest_out->filled == 0) {
             return 1;
         }
     }
@@ -767,6 +799,8 @@ static int run_dump(struct mcdump_conf *conf) {
     struct mcdump_buf responses_buf = {0};
     // for reading responses from the destination connection.
     struct mcdump_buf dest_in_buf = {0};
+    // for holding converted responses for destination conn.
+    struct mcdump_buf dest_out_buf = {0};
     struct mcdump_limiter bwlimit = {0};
     struct mcdump_stats stats = {0};
     struct mcdump_stats stats2 = {0};
@@ -802,6 +836,8 @@ static int run_dump(struct mcdump_conf *conf) {
     responses_buf.size = conf->read_bufsize;
     dest_in_buf.buf = malloc(DESTINBUF_SIZE);
     dest_in_buf.size = DESTINBUF_SIZE;
+    dest_out_buf.buf = malloc(conf->read_bufsize);
+    dest_out_buf.size = conf->read_bufsize;
 
     while (1) {
         int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
@@ -837,7 +873,8 @@ static int run_dump(struct mcdump_conf *conf) {
 
         run_requests_out(src_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
         run_responses_in(src_fd, &responses_buf, &requests_buf, &stats, conf->use_add);
-        run_dest_out(dest_fd, &responses_buf, &bwlimit);
+        move_responses(&responses_buf, &dest_out_buf);
+        run_dest_out(dest_fd, &dest_out_buf, &bwlimit);
         // periodically check in on the destination so we can give interactive
         // statistics/errors.
         check_dest_in(dest_fd, &dest_in_buf, &stats);
@@ -858,12 +895,15 @@ static int run_dump(struct mcdump_conf *conf) {
             to_poll[POLL_SOURCE].events |= POLLIN;
             do_poll = 1;
         }
-        if (responses_buf.want_writepoll) {
+        if (dest_out_buf.want_writepoll) {
             to_poll[POLL_DEST].events = POLLIN|POLLOUT;
             do_poll = 1;
         }
 
-        if (is_work_complete(&keys_buf, &responses_buf, &requests_buf)) {
+        if (is_work_complete(&keys_buf, &responses_buf, &requests_buf, &dest_out_buf)) {
+            if (conf->show_stats) {
+                fprintf(stderr, "=== Source read completed\n");
+            }
             break;
         }
 
