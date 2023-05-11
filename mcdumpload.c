@@ -653,59 +653,61 @@ static void run_dest_out(int dest_fd, struct mcdump_buf *data_in, struct mcdump_
 }
 
 static int run_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump_stats *stats) {
-    int read = recv(dest_fd, dest_in->buf + dest_in->filled, dest_in->size - dest_in->filled, 0);
-    if (read == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            // nothing to read right now.
-            return -1;
-        } else {
-            fprintf(stderr, "ERROR: destination connection closed\n");
-            exit(1);
-        }
-    }
-
-    dest_in->filled += read;
-    // TODO: how to "expect" the actual end of the stream?
-    // else we silently bail here if there's a missing newline but garbage on
-    // the line.
-    // add "expect_complete" flag argument?
-    // if read == 0 and something in the buffer and it's not MN print and die.
     while (1) {
-        char *start = dest_in->buf;
-        char *end = memchr(dest_in->buf, '\n', dest_in->filled);
-        if (end == NULL) {
-            break;
+        int read = recv(dest_fd, dest_in->buf + dest_in->filled, dest_in->size - dest_in->filled, 0);
+        if (read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // nothing to read right now.
+                return -1;
+            } else {
+                fprintf(stderr, "ERROR: destination connection closed\n");
+                exit(1);
+            }
         }
 
-        int len = end - start + 1;
+        dest_in->filled += read;
+        // TODO: how to "expect" the actual end of the stream?
+        // else we silently bail here if there's a missing newline but garbage on
+        // the line.
+        // add "expect_complete" flag argument?
+        // if read == 0 and something in the buffer and it's not MN print and die.
+        while (1) {
+            char *start = dest_in->buf;
+            char *end = memchr(dest_in->buf, '\n', dest_in->filled);
+            if (end == NULL) {
+                break;
+            }
 
-        // We don't need to pre-check the length since we only look at the
-        // start of the buffer and it will always be longer than the test
-        // string.
-        if (strncmp(start, "NS\r\n", len) == 0) {
-            stats->not_stored++;
-        } else if (strncmp(start, "SERVER_ERROR", len) == 0) {
-            fprintf(stderr, "%.*s", len, start);
-            stats->server_error++;
-        } else if (strncmp(start, "CLIENT_ERROR", len) == 0) {
-            fprintf(stderr, "%.*s", len, start);
-            fprintf(stderr, "ERROR: received CLIENT_ERROR from destination, protocol is out of sync and must stop\n");
-            exit(1);
-        } else if (strncmp(start, "ERROR", len) == 0) {
-            fprintf(stderr, "%.*s", len, start);
-            fprintf(stderr, "ERROR: received ERROR from destination, protocol is out of sync and must stop\n");
-            exit(1);
-        } else if (strncmp(start, "MN\r\n", len) == 0) {
-            dest_in->complete = 1;
-        } else {
-            fprintf(stderr, "ERROR: Got unexpected response from destination: %.*s", len, start);
-            exit(1);
+            int len = end - start + 1;
+
+            // We don't need to pre-check the length since we only look at the
+            // start of the buffer and it will always be longer than the test
+            // string.
+            if (strncmp(start, "NS\r\n", len) == 0) {
+                stats->not_stored++;
+            } else if (strncmp(start, "SERVER_ERROR", len) == 0) {
+                fprintf(stderr, "%.*s", len, start);
+                stats->server_error++;
+            } else if (strncmp(start, "CLIENT_ERROR", len) == 0) {
+                fprintf(stderr, "%.*s", len, start);
+                fprintf(stderr, "ERROR: received CLIENT_ERROR from destination, protocol is out of sync and must stop\n");
+                exit(1);
+            } else if (strncmp(start, "ERROR", len) == 0) {
+                fprintf(stderr, "%.*s", len, start);
+                fprintf(stderr, "ERROR: received ERROR from destination, protocol is out of sync and must stop\n");
+                exit(1);
+            } else if (strncmp(start, "MN\r\n", len) == 0) {
+                dest_in->complete = 1;
+            } else {
+                fprintf(stderr, "ERROR: Got unexpected response from destination: %.*s", len, start);
+                exit(1);
+            }
+            memmove(dest_in->buf, end+1, dest_in->filled - len);
+            dest_in->filled -= len;
         }
-        memmove(dest_in->buf, end+1, dest_in->filled - len);
-        dest_in->filled -= len;
     }
 
-    return read;
+    return 0;
 }
 
 static void check_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump_stats *stats) {
