@@ -126,6 +126,7 @@ struct mcdump_conf {
     uint32_t read_bufsize; // megabytes
     int use_add; // use add instead of set
     int show_stats; // print periodic stats
+    int dest_conns; // how many destination sockets to make
     struct mcdump_filter *filter;
 };
 
@@ -370,10 +371,8 @@ static int convert_data_in(struct mcdump_buf *data_in, int use_add) {
             // This nop is the finalizer from the key dumper, now we've seen
             // every possible response.
             if (strncmp(start, "MN\r\n", 4) == 0) {
-                // forward the mn along to the destination.
-                memcpy(start, "mn", 2);
-                parsed += 4;
                 data_in->complete = 1;
+                data_in->filled -= 4; // chop off the MN\r\n
                 break;
             }
             fprintf(stderr, "ERROR: bad response from data dump: %s\n", start);
@@ -613,30 +612,33 @@ static void run_responses_in(int src_fd, struct mcdump_buf *responses,
     }
 }
 
-#define DEST_OUT_RES 512 // save some space or end capping chunks of responses
-
 // move converted responses from the resp buffer to destination buffer
-static void move_responses(struct mcdump_buf *responses, struct mcdump_buf *dest_out) {
-    if (responses->parsed <= responses->consumed) {
-        return;
-    }
-    if (dest_out->filled >= dest_out->size - DEST_OUT_RES) {
-        fprintf(stderr, "DEST FULL\n");
-        return;
-    }
+static void move_responses(struct mcdump_buf *responses, struct mcdump_buf *dest_outs, int dest_conns) {
+    for (int x = 0; x < dest_conns; x++) {
+        struct mcdump_buf *dest_out = &dest_outs[x];
+        if (responses->parsed <= responses->consumed) {
+            break;
+        }
+        if (dest_out->filled >= dest_out->size) {
+            continue;
+        }
 
-    int tocopy = responses->parsed - responses->consumed;
-    int remain = dest_out->size - dest_out->filled;
-    if (tocopy > remain) {
-        tocopy = remain;
+        int tocopy = responses->parsed - responses->consumed;
+        int remain = dest_out->size - dest_out->filled;
+        if (tocopy > remain) {
+            // can only safely pull in responses if there's enough room to fit
+            // all of them. Or else we have to scan to ensure we don't end in
+            // the middle of a response.
+            continue;
+        }
+
+        memcpy(dest_out->buf + dest_out->filled,
+               responses->buf + responses->consumed,
+               tocopy);
+
+        responses->consumed += tocopy;
+        dest_out->filled += tocopy;
     }
-
-    memcpy(dest_out->buf + dest_out->filled,
-           responses->buf + responses->consumed,
-           tocopy);
-
-    responses->consumed += tocopy;
-    dest_out->filled += tocopy;
 
     if (responses->consumed == responses->parsed) {
         // shift a partial buffer.
@@ -652,34 +654,39 @@ static void move_responses(struct mcdump_buf *responses, struct mcdump_buf *dest
     }
 }
 
-static void run_dest_out(int dest_fd, struct mcdump_buf *dest_out, struct mcdump_limiter *bwlimit) {
-    // anything to write out?
-    if (dest_out->filled <= dest_out->consumed) {
-        return;
-    }
-
-    int tosend = dest_out->filled - dest_out->consumed;
-    if (bwlimit->limit != 0 && bwlimit->remain < tosend) {
-        tosend = bwlimit->remain;
-    }
-
-    dest_out->want_writepoll = 0;
-    int sent = send(dest_fd, dest_out->buf + dest_out->consumed, tosend, 0);
-    if (sent == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            dest_out->want_writepoll = 1;
-        } else {
-            fprintf(stderr, "ERROR: destination connection closed\n");
-            exit(1);
+static void run_dest_out(int *dest_fds, struct mcdump_buf *dest_outs, int dest_conns,
+        struct mcdump_limiter *bwlimit) {
+    for (int x = 0; x < dest_conns; x++) {
+        int dest_fd = dest_fds[x];
+        struct mcdump_buf *dest_out = &dest_outs[x];
+        // anything to write out?
+        if (dest_out->filled <= dest_out->consumed) {
+            continue;
         }
-    } else {
-        dest_out->consumed += sent;
-        run_bwlimit(bwlimit, sent);
-    }
 
-    if (dest_out->consumed == dest_out->filled) {
-        dest_out->consumed = 0;
-        dest_out->filled = 0;
+        int tosend = dest_out->filled - dest_out->consumed;
+        if (bwlimit->limit != 0 && bwlimit->remain < tosend) {
+            tosend = bwlimit->remain;
+        }
+
+        dest_out->want_writepoll = 0;
+        int sent = send(dest_fd, dest_out->buf + dest_out->consumed, tosend, 0);
+        if (sent == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                dest_out->want_writepoll = 1;
+            } else {
+                fprintf(stderr, "ERROR: destination connection closed\n");
+                exit(1);
+            }
+        } else {
+            dest_out->consumed += sent;
+            run_bwlimit(bwlimit, sent);
+        }
+
+        if (dest_out->consumed == dest_out->filled) {
+            dest_out->consumed = 0;
+            dest_out->filled = 0;
+        }
     }
 }
 
@@ -775,9 +782,15 @@ static void check_stats(struct mcdump_stats *stats, struct mcdump_stats *stats2)
 static int is_work_complete(struct mcdump_buf *keys,
                             struct mcdump_buf *responses,
                             struct mcdump_buf *keys_out,
-                            struct mcdump_buf *dest_out) {
+                            struct mcdump_buf *dest_outs,
+                            int dest_conns) {
     if (keys->complete == 1) {
-        if (responses->complete == 1 && responses->filled == 0 && dest_out->filled == 0) {
+        if (responses->complete == 1 && responses->filled == 0) {
+            for (int x = 0; x < dest_conns; x++) {
+                if (dest_outs[x].filled != 0) {
+                    return 0;
+                }
+            }
             return 1;
         }
     }
@@ -789,8 +802,12 @@ static int is_work_complete(struct mcdump_buf *keys,
 #define POLL_SOURCE 1
 #define POLL_DEST 2
 
+#define MAXDESTS 8
+#define PCNT MAXDESTS + 3
+
 static int run_dump(struct mcdump_conf *conf) {
-    struct pollfd to_poll[3];
+    int dest_conns = conf->dest_conns;
+    struct pollfd to_poll[PCNT] = {0};
     // for reading the list of keys
     struct mcdump_buf keys_buf = {0};
     // for holding requests converted from the key list
@@ -798,9 +815,9 @@ static int run_dump(struct mcdump_conf *conf) {
     // for reading responses back from the source connection
     struct mcdump_buf responses_buf = {0};
     // for reading responses from the destination connection.
-    struct mcdump_buf dest_in_buf = {0};
+    struct mcdump_buf dest_in_bufs[MAXDESTS] = {0};
     // for holding converted responses for destination conn.
-    struct mcdump_buf dest_out_buf = {0};
+    struct mcdump_buf dest_out_bufs[MAXDESTS] = {0};
     struct mcdump_limiter bwlimit = {0};
     struct mcdump_stats stats = {0};
     struct mcdump_stats stats2 = {0};
@@ -819,14 +836,17 @@ static int run_dump(struct mcdump_conf *conf) {
         keys_fd = dump_connect(conf->key_host, conf->key_port);
     }
     int src_fd = dump_connect(conf->source_host, conf->source_port);
-    int dest_fd = dump_connect(conf->dest_host, conf->dest_port);
+    int dest_fds[MAXDESTS];
+    for (int x = 0; x < dest_conns; x++) {
+        dest_fds[x] = dump_connect(conf->dest_host, conf->dest_port);
+        to_poll[POLL_DEST + x].fd = dest_fds[x];
+        to_poll[POLL_DEST + x].events = 0;
+    }
 
     to_poll[POLL_KEYS].fd = keys_fd;
     to_poll[POLL_KEYS].events = 0;
     to_poll[POLL_SOURCE].fd = src_fd;
     to_poll[POLL_SOURCE].events = 0;
-    to_poll[POLL_DEST].fd = dest_fd;
-    to_poll[POLL_DEST].events = 0;
 
     keys_buf.buf = malloc(KEYSBUF_SIZE);
     keys_buf.size = KEYSBUF_SIZE;
@@ -834,10 +854,12 @@ static int run_dump(struct mcdump_conf *conf) {
     requests_buf.size = DATA_WRITEBUF_SIZE;
     responses_buf.buf = malloc(conf->read_bufsize);
     responses_buf.size = conf->read_bufsize;
-    dest_in_buf.buf = malloc(DESTINBUF_SIZE);
-    dest_in_buf.size = DESTINBUF_SIZE;
-    dest_out_buf.buf = malloc(conf->read_bufsize);
-    dest_out_buf.size = conf->read_bufsize;
+    for (int x = 0; x < dest_conns; x++) {
+        dest_in_bufs[x].buf = malloc(DESTINBUF_SIZE);
+        dest_in_bufs[x].size = DESTINBUF_SIZE;
+        dest_out_bufs[x].buf = malloc(conf->read_bufsize);
+        dest_out_bufs[x].size = conf->read_bufsize;
+    }
 
     while (1) {
         int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
@@ -873,11 +895,13 @@ static int run_dump(struct mcdump_conf *conf) {
 
         run_requests_out(src_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
         run_responses_in(src_fd, &responses_buf, &requests_buf, &stats, conf->use_add);
-        move_responses(&responses_buf, &dest_out_buf);
-        run_dest_out(dest_fd, &dest_out_buf, &bwlimit);
+        move_responses(&responses_buf, dest_out_bufs, dest_conns);
+        run_dest_out(dest_fds, dest_out_bufs, dest_conns, &bwlimit);
         // periodically check in on the destination so we can give interactive
         // statistics/errors.
-        check_dest_in(dest_fd, &dest_in_buf, &stats);
+        for (int x = 0; x < dest_conns; x++) {
+            check_dest_in(dest_fds[x], &dest_in_bufs[x], &stats);
+        }
         if (conf->show_stats) {
             check_stats(&stats, &stats2);
         }
@@ -895,12 +919,22 @@ static int run_dump(struct mcdump_conf *conf) {
             to_poll[POLL_SOURCE].events |= POLLIN;
             do_poll = 1;
         }
-        if (dest_out_buf.want_writepoll) {
-            to_poll[POLL_DEST].events = POLLIN|POLLOUT;
+        if (responses_buf.want_readpoll) {
+            to_poll[POLL_SOURCE].events |= POLLIN;
+            do_poll = 1;
+        }
+        int dests_full = 0;
+        for (int x = 0; x < dest_conns; x++) {
+            if (dest_out_bufs[x].want_writepoll) {
+                to_poll[POLL_DEST+x].events = POLLIN|POLLOUT;
+                dests_full++;
+            }
+        }
+        if (dests_full == dest_conns) {
             do_poll = 1;
         }
 
-        if (is_work_complete(&keys_buf, &responses_buf, &requests_buf, &dest_out_buf)) {
+        if (is_work_complete(&keys_buf, &responses_buf, &requests_buf, dest_out_bufs, dest_conns)) {
             if (conf->show_stats) {
                 fprintf(stderr, "=== Source read completed\n");
             }
@@ -910,15 +944,17 @@ static int run_dump(struct mcdump_conf *conf) {
         run_limiter(&bwlimit); // pause if necessary
         if (do_poll) {
             // TODO: check POLLHUP/etc
-            int ret = poll(to_poll, 3, 1000);
+            int ret = poll(to_poll, 3+dest_conns, 1000);
             if (ret < 0) {
                 abort();
             }
             // destination socket can block writes if we need to read.
-            if (to_poll[POLL_DEST].revents & POLLIN) {
-                run_dest_in(dest_fd, &dest_in_buf, &stats);
+            for (int x = 0; x < dest_conns; x++) {
+                if (to_poll[POLL_DEST+x].revents & POLLIN) {
+                    run_dest_in(dest_fds[x], &dest_in_bufs[x], &stats);
+                }
             }
-            for (int x = 0; x <= POLL_DEST; x++) {
+            for (int x = 0; x < PCNT; x++) {
                 to_poll[x].events = 0;
             }
             if (ret == 0) // FIXME: just loop poll?
@@ -926,13 +962,36 @@ static int run_dump(struct mcdump_conf *conf) {
         }
     }
 
+    // Drop an endcap down each destination so we can know they've consumed
+    // all of the converted requests.
+    for (int x = 0; x < PCNT; x++) {
+        to_poll[x].events = 0;
+    }
+    for (int x = 0; x < dest_conns; x++) {
+        int sent = send(dest_fds[x], "mn\r\n", 4, 0);
+        to_poll[POLL_DEST+x].events |= POLLIN;
+        if (sent < 4) {
+            fprintf(stderr, "Fuck\n");
+            abort();
+        }
+    }
+
     while (1) {
-        run_dest_in(dest_fd, &dest_in_buf, &stats);
-        if (dest_in_buf.complete) {
+        int complete = 0;
+        for (int x = 0; x < dest_conns; x++) {
+            run_dest_in(dest_fds[x], &dest_in_bufs[x], &stats);
+            if (dest_in_bufs[x].complete) {
+                complete++;
+            }
+        }
+        if (complete == dest_conns) {
             fprintf(stderr, "Dumpload complete\n");
             break;
         } else {
-            poll_for(to_poll, POLL_DEST, POLLIN);
+            int ret = poll(to_poll, 3+dest_conns, 1000);
+            if (ret < 0) {
+                abort();
+            }
         }
     }
 
@@ -966,7 +1025,8 @@ int main(int argc, char **argv) {
     struct mcdump_conf conf = {.source_host = "127.0.0.1", .source_port = "11211",
                                .key_host = "127.0.0.1", .key_port = "11211",
                                .dest_bwlimit = 0, .src_reqlimit = 0, .use_add = 0,
-                               .read_bufsize = DATA_READBUF_DEFAULT};
+                               .read_bufsize = DATA_READBUF_DEFAULT,
+                               .dest_conns = 1};
     int dest_host = 0;
     int dest_port = 0;
     int key_host = 0;
@@ -978,6 +1038,7 @@ int main(int argc, char **argv) {
         {"srcport", required_argument, 0, 'p'},
         {"dstip", required_argument, 0, 'd'},
         {"dstport", required_argument, 0, 's'},
+        {"dstconns", required_argument, 0, 'c'},
         {"keylistip", required_argument, 0, 'w'},
         {"keylistport", required_argument, 0, 'e'},
         {"dstbwlimit", required_argument, 0, 'l'},
@@ -1017,6 +1078,13 @@ int main(int argc, char **argv) {
         case 's':
             strncpy(conf.dest_port, optarg, NI_MAXSERV-1);
             dest_port = 1;
+            break;
+        case 'c':
+            conf.dest_conns = atoi(optarg);
+            if (conf.dest_conns > MAXDESTS) {
+                fprintf(stderr, "ERROR: Limit of 8 destination connections\n");
+                return EXIT_FAILURE;
+            }
             break;
         case 'w':
             strncpy(conf.key_host, optarg, NI_MAXHOST-1);
