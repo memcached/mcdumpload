@@ -111,6 +111,7 @@ struct mcdump_stats {
     uint64_t not_stored;
     uint64_t server_error;
     uint64_t requests;
+    uint64_t dest_bytes;
     struct timeval next_check;
 };
 
@@ -655,7 +656,7 @@ static void move_responses(struct mcdump_buf *responses, struct mcdump_buf *dest
 }
 
 static void run_dest_out(int *dest_fds, struct mcdump_buf *dest_outs, int dest_conns,
-        struct mcdump_limiter *bwlimit) {
+        struct mcdump_limiter *bwlimit, struct mcdump_stats *stats) {
     for (int x = 0; x < dest_conns; x++) {
         int dest_fd = dest_fds[x];
         struct mcdump_buf *dest_out = &dest_outs[x];
@@ -680,6 +681,7 @@ static void run_dest_out(int *dest_fds, struct mcdump_buf *dest_outs, int dest_c
             }
         } else {
             dest_out->consumed += sent;
+            stats->dest_bytes += sent;
             run_bwlimit(bwlimit, sent);
         }
 
@@ -769,11 +771,13 @@ static void check_stats(struct mcdump_stats *stats, struct mcdump_stats *stats2)
     s.not_stored = stats->not_stored - stats2->not_stored;
     s.server_error = stats->server_error - stats2->server_error;
     s.requests = stats->requests - stats2->requests;
+    s.dest_bytes = stats->dest_bytes - stats2->dest_bytes;
 
-    fprintf(stderr, "===STATS=== NS: [%llu] SERVER_ERROR: [%llu] REQUESTS: [%llu]\n",
+    fprintf(stderr, "===STATS=== NS: [%llu] SERVER_ERROR: [%llu] RESPONSES_IN: [%llu] DEST_BYTES_OUT: [%llu]\n",
             (unsigned long long)s.not_stored,
             (unsigned long long)s.server_error,
-            (unsigned long long)s.requests);
+            (unsigned long long)s.requests,
+            (unsigned long long)s.dest_bytes);
 
     stats->next_check = now;
     *stats2 = *stats;
@@ -896,7 +900,7 @@ static int run_dump(struct mcdump_conf *conf) {
         run_requests_out(src_fd, &keys_buf, &requests_buf, &bwlimit, conf->filter);
         run_responses_in(src_fd, &responses_buf, &requests_buf, &stats, conf->use_add);
         move_responses(&responses_buf, dest_out_bufs, dest_conns);
-        run_dest_out(dest_fds, dest_out_bufs, dest_conns, &bwlimit);
+        run_dest_out(dest_fds, dest_out_bufs, dest_conns, &bwlimit, &stats);
         // periodically check in on the destination so we can give interactive
         // statistics/errors.
         for (int x = 0; x < dest_conns; x++) {
