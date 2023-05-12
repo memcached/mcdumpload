@@ -1007,6 +1007,7 @@ static void usage(void) {
            "--srcport=<port> (11211)\n"
            "--dstip=<addr> (no default)\n"
            "--dstport=<port> (no default)\n"
+           "--dstconns=<count> (1)\n"
            "--keylistip=<addr> (srcip) ['-' for STDIN]\n"
            "--keylistport=<port> (srcport)\n"
            "--srcratelimit=<requests/sec> (0)\n"
