@@ -128,6 +128,7 @@ struct mcdump_conf {
     int use_add; // use add instead of set
     int show_stats; // print periodic stats
     int dest_conns; // how many destination sockets to make
+    int key_timeout; // how many seconds to wait for lru_crawler
     struct mcdump_filter *filter;
 };
 
@@ -865,7 +866,8 @@ static int run_dump(struct mcdump_conf *conf) {
         dest_out_bufs[x].size = conf->read_bufsize;
     }
 
-    while (1) {
+    int keydump_started = 0;
+    for (int x = 0; x < conf->key_timeout; x++) {
         int sent = send(keys_fd, MGDUMP_START, sizeof(MGDUMP_START)-1, 0);
         if (sent < sizeof(MGDUMP_START)-1) {
             fprintf(stderr, "ERROR: Failed write for fetching key list\n");
@@ -877,6 +879,7 @@ static int run_dump(struct mcdump_conf *conf) {
         if (keys_buf.filled >= 4) {
             if (strncmp(keys_buf.buf, "BUSY", 4) == 0) {
                 // reset the keys buffer and loop again.
+                fprintf(stderr, "BUSY: lru_crawler is busy, waiting\n");
                 keys_buf.filled = 0;
                 sleep(1);
                 continue;
@@ -885,8 +888,14 @@ static int run_dump(struct mcdump_conf *conf) {
                         keys_buf.filled, keys_buf.buf);
                 exit(EXIT_FAILURE);
             }
+            keydump_started = 1;
             break;
         }
+    }
+
+    if (keydump_started == 0) {
+        fprintf(stderr, "ERROR: timed out waiting for lru_crawler to become available\n");
+        exit(EXIT_FAILURE);
     }
 
     // core loop
@@ -1019,6 +1028,7 @@ static void usage(void) {
            "--readbufsize=<megabytes> (2)\n"
            "--keyinclude=<prefix> ("")\n"
            "--keyexclude=<prefix> ("")\n"
+           "--keytimeout=N (30) (seconds to wait for lru_crawler to become available)\n"
            "--add (use meta adds instead of sets)\n"
            "--stats (print some stats once per second to STDERR)\n"
           );
@@ -1031,7 +1041,8 @@ int main(int argc, char **argv) {
                                .key_host = "127.0.0.1", .key_port = "11211",
                                .dest_bwlimit = 0, .src_reqlimit = 0, .use_add = 0,
                                .read_bufsize = DATA_READBUF_DEFAULT,
-                               .dest_conns = 1};
+                               .dest_conns = 1,
+                               .key_timeout = 30};
     int dest_host = 0;
     int dest_port = 0;
     int key_host = 0;
@@ -1051,6 +1062,8 @@ int main(int argc, char **argv) {
         {"readbufsize", required_argument, 0, 'b'},
         {"keyinclude", required_argument, 0, 'k'},
         {"keyexclude", required_argument, 0, 'x'},
+        {"keytimeout", required_argument, 0, 'y'},
+
         {"add", no_argument, 0, 'a'},
         {"stats", no_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
@@ -1107,6 +1120,9 @@ int main(int argc, char **argv) {
             break;
         case 'b':
             conf.read_bufsize = atoi(optarg) * (1024 * 1024);
+            break;
+        case 'y':
+            conf.key_timeout = atoi(optarg);
             break;
         case 'k':
             if (curfilter) {
