@@ -724,20 +724,20 @@ static int run_dest_in(int dest_fd, struct mcdump_buf *dest_in, struct mcdump_st
             // We don't need to pre-check the length since we only look at the
             // start of the buffer and it will always be longer than the test
             // string.
-            if (strncmp(start, "NS\r\n", len) == 0) {
+            if (strncmp(start, "NS\r\n", strlen("NS\r\n")) == 0) {
                 stats->not_stored++;
-            } else if (strncmp(start, "SERVER_ERROR", len) == 0) {
+            } else if (strncmp(start, "SERVER_ERROR", strlen("SERVER_ERROR")) == 0) {
                 fprintf(stderr, "%.*s", len, start);
                 stats->server_error++;
-            } else if (strncmp(start, "CLIENT_ERROR", len) == 0) {
-                fprintf(stderr, "%.*s", len, start);
+            } else if (strncmp(start, "CLIENT_ERROR", strlen("CLIENT_ERROR")) == 0) {
                 fprintf(stderr, "ERROR: received CLIENT_ERROR from destination, protocol is out of sync and must stop\n");
-                exit(1);
-            } else if (strncmp(start, "ERROR", len) == 0) {
                 fprintf(stderr, "%.*s", len, start);
-                fprintf(stderr, "ERROR: received ERROR from destination, protocol is out of sync and must stop\n");
                 exit(1);
-            } else if (strncmp(start, "MN\r\n", len) == 0) {
+            } else if (strncmp(start, "ERROR", strlen("ERROR")) == 0) {
+                fprintf(stderr, "ERROR: received ERROR from destination, protocol is out of sync and must stop\n");
+                fprintf(stderr, "%.*s", len, start);
+                exit(1);
+            } else if (strncmp(start, "MN\r\n", strlen("MN\r\n")) == 0) {
                 dest_in->complete = 1;
             } else {
                 fprintf(stderr, "ERROR: Got unexpected response from destination: %.*s", len, start);
